@@ -1,3 +1,4 @@
+# .github/workflows/openapi-security-mcp.yml
 name: OpenAPI → Security tests with Postman MCP
 
 on:
@@ -13,8 +14,8 @@ permissions:
   security-events: write
 
 env:
-  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}
-  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}
+  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}            # e.g. https://mcp.postman.com/mcp
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
   POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
 
 jobs:
@@ -22,15 +23,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Set up Node (for Postman CLI & oasdiff tooling)
+      - name: Setup Node (for swagger-cli)
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -45,39 +48,74 @@ jobs:
         run: |
           # Postman CLI (official)
           curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
-          # OpenAPI helpers
-          npm i -g @apidevtools/swagger-cli@4 oasdiff@3
+          # OpenAPI validator
+          npm i -g @apidevtools/swagger-cli@4
+          postman --version
+          swagger-cli --version
+          docker --version
 
       - name: Start sample app (localhost:8000)
         run: |
           python app/app.py &
           echo $! > app.pid
-          # quick wait for server
-          for i in {1..30}; do
-            curl -sSf http://127.0.0.1:8000/pets || true
+          # simple warmup
+          for i in {1..20}; do
+            if curl -fsS http://127.0.0.1:8000/pets >/dev/null 2>&1; then
+              echo "App is up"; break
+            fi
             sleep 1
           done
 
-      - name: LLM → plan & create collection via official Postman MCP
+      - name: Compute OpenAPI diff (base vs head) with Dockerized oasdiff
+        run: |
+          BASE=origin/${{ github.base_ref }}
+          HEAD=origin/${{ github.head_ref }}
+          mkdir -p .tmp
+          FILE=$(git diff --name-only $BASE...$HEAD | grep -E '^openapi/.*\.(ya?ml|json)$' | head -n1)
+          if [ -z "$FILE" ]; then
+            echo "No OpenAPI changes detected."
+            # create an empty diff to keep later steps happy (agent will handle)
+            echo '{}' > diff.json
+            exit 0
+          fi
+
+          git show $BASE:$FILE > .tmp/base.yaml || cp openapi/api.v1.yaml .tmp/base.yaml
+          git show $HEAD:$FILE > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
+
+          swagger-cli validate .tmp/base.yaml
+          swagger-cli validate .tmp/head.yaml
+
+          docker run --rm \
+            -v "$PWD/.tmp:/work" -w /work \
+            oasdiff/oasdiff:latest \
+            diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
+
+          echo "Wrote diff.json"
+
+      - name: LLM → plan & create/overwrite collection via official Postman MCP
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
-          python tools/agent_openapi_to_postman.py --base openapi/api.v1.yaml --head openapi/api.yaml \
-            --diff diff.json --collection "security test collection" --plan plan.json
+          python tools/agent_openapi_to_postman.py \
+            --base openapi/api.v1.yaml \
+            --head openapi/api.yaml \
+            --diff diff.json \
+            --collection "security test collection" \
+            --plan plan.json
 
-      - name: Run collection with Postman CLI (JSON reporter)
+      - name: Run generated collection with Postman CLI (JSON reporter)
         run: |
+          # Uses default env vars baked in collection: baseUrl=http://127.0.0.1:8000, token=demo-token
           postman collection run ./generated-security-test.postman_collection.json \
             --reporters cli,json \
             --reporter-json-export run.json
-        # Postman CLI reporters are officially supported for CI. :contentReference[oaicite:3]{index=3}
 
-      - name: Convert to SARIF
+      - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      - name: Upload SARIF to Code Scanning
+      - name: Upload SARIF to GitHub Code Scanning
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
@@ -86,4 +124,4 @@ jobs:
       - name: Stop sample app
         if: always()
         run: |
-          kill $(cat app.pid) || true
+          kill "$(cat app.pid)" 2>/dev/null || true
