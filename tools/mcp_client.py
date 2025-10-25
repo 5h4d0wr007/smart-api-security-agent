@@ -1,0 +1,24 @@
+import os, json, uuid, requests
+
+class McpHttp:
+    def __init__(self, url: str, api_key: str):
+        self.url = url.rstrip("/")
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+
+    def _rpc(self, method: str, params: dict | None = None):
+        payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method}
+        if params is not None:
+            payload["params"] = params
+        r = requests.post(self.url, headers=self.headers, data=json.dumps(payload), timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        if "error" in data:
+            raise RuntimeError(f"MCP error {data['error']}")
+        return data.get("result")
+
+    # Helpers for common MCP methods
+    def list_tools(self):         return self._rpc("tools/list", {})
+    def call_tool(self, name, arguments: dict): return self._rpc("tools/call", {"name": name, "arguments": arguments})

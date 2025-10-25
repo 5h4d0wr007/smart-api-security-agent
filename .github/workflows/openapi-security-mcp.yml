@@ -1,0 +1,89 @@
+name: OpenAPI → Security tests with Postman MCP
+
+on:
+  pull_request:
+    paths:
+      - "openapi/**.y*ml"
+      - "openapi/**.json"
+      - "app/**"
+      - "tools/**"
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}
+  POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
+
+jobs:
+  test-on-openapi-change:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node (for Postman CLI & oasdiff tooling)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt
+          pip install openai requests
+
+      - name: Install CLI tooling
+        run: |
+          # Postman CLI (official)
+          curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
+          # OpenAPI helpers
+          npm i -g @apidevtools/swagger-cli@4 oasdiff@3
+
+      - name: Start sample app (localhost:8000)
+        run: |
+          python app/app.py &
+          echo $! > app.pid
+          # quick wait for server
+          for i in {1..30}; do
+            curl -sSf http://127.0.0.1:8000/pets || true
+            sleep 1
+          done
+
+      - name: LLM → plan & create collection via official Postman MCP
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+        run: |
+          python tools/agent_openapi_to_postman.py --base openapi/api.v1.yaml --head openapi/api.yaml \
+            --diff diff.json --collection "security test collection" --plan plan.json
+
+      - name: Run collection with Postman CLI (JSON reporter)
+        run: |
+          postman collection run ./generated-security-test.postman_collection.json \
+            --reporters cli,json \
+            --reporter-json-export run.json
+        # Postman CLI reporters are officially supported for CI. :contentReference[oaicite:3]{index=3}
+
+      - name: Convert to SARIF
+        run: |
+          python tools/cli_report_to_sarif.py run.json sarif.json
+
+      - name: Upload SARIF to Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif.json
+          category: openapi-postman-security
+
+      - name: Stop sample app
+        if: always()
+        run: |
+          kill $(cat app.pid) || true
