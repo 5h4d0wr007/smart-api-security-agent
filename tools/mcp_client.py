@@ -2,16 +2,37 @@
 import json
 import uuid
 import requests
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
+
+def _maybe_parse_json_string(s: str) -> Any:
+    """Try to parse JSON from a raw string; fall back to extracting the first {...} or [...] block."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = s.find(opener)
+        end = s.rfind(closer)
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(s[start:end+1])
+            except Exception:
+                continue
+    return None
 
 class McpHttp:
     """
     Minimal JSON-RPC client for MCP Streamable HTTP.
 
-    - Sends Accept: "application/json, text/event-stream"
-    - Parses plain JSON responses
-    - Gracefully handles empty bodies (202/204 or 200 with no content)
-    - Parses text/event-stream by accumulating 'data:' JSON payload lines
+    Handles:
+    - Accept: "application/json, text/event-stream"
+    - Plain JSON ("{jsonrpc:..., result: ...}")
+    - Message envelopes: {"content":[{"type":"text","text":"{...json...}"}]}
+    - SSE text/event-stream with "data: {...}" lines
+    - Empty bodies (202/204)
     """
     def __init__(self, url: str, api_key: str, timeout_sec: int = 120):
         self.url = url.rstrip("/")
@@ -37,54 +58,77 @@ class McpHttp:
         # Raise for HTTP errors first (so we can see the status)
         r.raise_for_status()
 
-        # Short-circuit on empty body (legal in some tool calls)
         body = r.text or ""
         if not body.strip():
             return None
 
         ctype = (r.headers.get("Content-Type") or "").lower()
 
-        # Fast path: JSON
+        # 1) Fast path: application/json
         if "application/json" in ctype:
             try:
                 data = r.json()
-                if isinstance(data, dict) and "error" in data:
-                    raise RuntimeError(f"MCP error {data['error']}")
-                if isinstance(data, dict):
-                    return data.get("result", data)
-                return data
-            except json.JSONDecodeError:
-                # Fall through to SSE/lenient parsing
-                pass
+            except requests.exceptions.JSONDecodeError:
+                data = _maybe_parse_json_string(body)
 
-        # SSE path: parse "data: { ... }" lines and take the last JSON object
+            # Plain JSON-RPC
+            if isinstance(data, dict) and "result" in data:
+                res = data["result"]
+                # Some servers still wrap result in "content" array; unwrap
+                if isinstance(res, dict) and "content" in res:
+                    unwrapped = self._unwrap_content(res["content"])
+                    return unwrapped if unwrapped is not None else res
+                return res
+
+            # Message envelope at top-level
+            if isinstance(data, dict) and "content" in data:
+                unwrapped = self._unwrap_content(data["content"])
+                return unwrapped if unwrapped is not None else data
+
+            # Already a useful object/list
+            return data
+
+        # 2) SSE path: text/event-stream
         if "text/event-stream" in ctype or body.startswith("event:") or "data:" in body:
             last_json = None
             for raw_line in body.splitlines():
                 line = raw_line.strip()
                 if not line.startswith("data:"):
                     continue
-                # Strip leading "data:" and any leading space
-                data_str = line[5:].lstrip()
-                if not data_str:
-                    continue
-                try:
-                    candidate = json.loads(data_str)
-                    # If this looks like a JSON-RPC envelope, unwrap result
-                    if isinstance(candidate, dict) and "result" in candidate:
-                        last_json = candidate["result"]
+                js = _maybe_parse_json_string(line[5:].lstrip())
+                if js is not None:
+                    # Unwrap if it's a JSON-RPC envelope
+                    if isinstance(js, dict) and "result" in js:
+                        last_json = js["result"]
                     else:
-                        last_json = candidate
-                except json.JSONDecodeError:
-                    continue
+                        last_json = js
+            # If last_json is itself a message envelope, unwrap its content
+            if isinstance(last_json, dict) and "content" in last_json:
+                unwrapped = self._unwrap_content(last_json["content"])
+                return unwrapped if unwrapped is not None else last_json
             return last_json
 
-        # Lenient fallback: try to locate a JSON object/array in text
-        try:
-            return json.loads(body)
-        except Exception:
-            # As a last resort, just return raw text so caller can decide
-            return body
+        # 3) Lenient fallback
+        parsed = _maybe_parse_json_string(body)
+        return parsed if parsed is not None else body
+
+    def _unwrap_content(self, content: Any) -> Any:
+        """
+        Given a "content" array like:
+          [{"type":"text","text":"{...json...}"}]
+        collect text, parse JSON, and return the parsed object.
+        """
+        if not isinstance(content, list):
+            return None
+        texts: List[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                t = part.get("text", "")
+                if t:
+                    texts.append(str(t))
+        joined = "\n".join(texts)
+        parsed = _maybe_parse_json_string(joined)
+        return parsed
 
     def list_tools(self) -> Any:
         return self._rpc("tools/list", {})

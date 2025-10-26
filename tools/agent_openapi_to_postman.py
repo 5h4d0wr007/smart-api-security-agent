@@ -177,22 +177,46 @@ def main():
     # 4) Official Postman MCP (remote): workspace by NAME, CRUD+export collection
     mcp = McpHttp(os.environ["POSTMAN_MCP_URL"], os.environ["POSTMAN_API_KEY"])
 
-    workspaces = mcp.call_tool("getWorkspaces", {})  # may be dict, list, or None depending on transport
+    workspaces = mcp.call_tool("getWorkspaces", {})
     if workspaces is None:
         raise SystemExit("MCP getWorkspaces returned no content. "
                          "Check POSTMAN_MCP_URL, API key scope, and network access.")
 
-    # Normalize to a list of workspaces; Postman MCP typically returns {"items":[...]}
+    # Normalize to a list of workspaces; Postman MCP may return:
+    #  - {"items":[{...},{...}]}
+    #  - {"workspaces":[{...},{...}]}
+    #  - [{...}, {...}]
     items: List[Dict[str, Any]] = []
-    if isinstance(workspaces, dict) and "items" in workspaces and isinstance(workspaces["items"], list):
-        items = workspaces["items"]
+    if isinstance(workspaces, dict):
+        if isinstance(workspaces.get("items"), list):
+            items = workspaces["items"]
+        elif isinstance(workspaces.get("workspaces"), list):
+            items = workspaces["workspaces"]
+        elif isinstance(workspaces.get("content"), list):
+            # Defensive: handle unwrapped message envelope
+            texts = [c.get("text","") for c in workspaces["content"] if isinstance(c, dict)]
+            joined = "\n".join(texts)
+            try:
+                parsed = json.loads(joined)
+                if isinstance(parsed, dict):
+                    if isinstance(parsed.get("items"), list):
+                        items = parsed["items"]
+                    elif isinstance(parsed.get("workspaces"), list):
+                        items = parsed["workspaces"]
+            except Exception:
+                pass
+        else:
+            # Maybe it's a single workspace object
+            if workspaces.get("id") and workspaces.get("name"):
+                items = [workspaces]
     elif isinstance(workspaces, list):
-        items = workspaces
-    else:
-        raise SystemExit(f"Unexpected getWorkspaces shape: {type(workspaces)} {str(workspaces)[:200]}")
+        items = [w for w in workspaces if isinstance(w, dict)]
+
+    if not items:
+        raise SystemExit(f"Unexpected getWorkspaces shape: {type(workspaces)} {str(workspaces)[:300]}")
 
     ws_name = os.environ.get("POSTMAN_WORKSPACE_NAME","Security Demo")
-    ws = next((w for w in items if (isinstance(w, dict) and w.get("name")==ws_name)), None)
+    ws = next((w for w in items if w.get("name")==ws_name), None)
     if not ws:
         names = [w.get("name") for w in items if isinstance(w, dict)]
         raise SystemExit(f"Workspace not found by name: {ws_name} (found: {names})")
@@ -203,6 +227,7 @@ def main():
     existing = mcp.call_tool("searchCollections", {"workspaceId": workspace_id, "query": args.collection})
     if isinstance(existing, dict) and existing.get("items"):
         mcp.call_tool("deleteCollection", {"id": existing["items"][0]["id"]})
+
     created = mcp.call_tool("createCollection", {"workspaceId": workspace_id, "name": args.collection})
     if not (isinstance(created, dict) and "collection" in created and "id" in created["collection"]):
         raise SystemExit(f"Unexpected createCollection response: {type(created)} {str(created)[:200]}")
