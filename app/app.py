@@ -1,8 +1,7 @@
-from flask import Flask, jsonify, request, abort
+from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# Mock users and pets
 USERS = {
     "u1": {"id": "u1", "role": "user", "token": "token-user-u1"},
     "u2": {"id": "u2", "role": "user", "token": "token-user-u2"},
@@ -14,7 +13,6 @@ PETS = {
     "p2": {"id": "p2", "name": "Milo", "owner": "u2", "type": "cat"},
 }
 
-# Utility helpers
 def current_user():
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
@@ -24,9 +22,7 @@ def current_user():
                 return u
     return None
 
-# -------------------------
-# GET /pets/<pid> → BOLA issue (no owner check)
-# -------------------------
+# ----------------- BOLA -----------------
 @app.get("/pets/<pid>")
 def get_pet(pid):
     u = current_user()
@@ -35,12 +31,10 @@ def get_pet(pid):
     pet = PETS.get(pid)
     if not pet:
         return jsonify({"error": "not found"}), 404
-    # BOLA: missing check -> any user can see any pet
+    # BOLA: no owner check
     return jsonify(pet), 200
 
-# -------------------------
-# PATCH /pets/<pid> → BFLA issue (no role check for admin-only op)
-# -------------------------
+# ----------------- BFLA -----------------
 @app.patch("/pets/<pid>")
 def update_pet(pid):
     u = current_user()
@@ -51,15 +45,13 @@ def update_pet(pid):
         return jsonify({"error": "not found"}), 404
     data = request.get_json(force=True, silent=True) or {}
     if "owner" in data:
-        # BFLA: should be admin-only, but we don't check
+        # BFLA: non-admin users can transfer ownership
         pet["owner"] = data["owner"]
     if "name" in data:
         pet["name"] = data["name"]
     return jsonify(pet), 200
 
-# -------------------------
-# POST /pets/<pid>/transfer → fixed endpoint (safe)
-# -------------------------
+# ----------------- Safe transfer -----------------
 @app.post("/pets/<pid>/transfer")
 def transfer_pet(pid):
     u = current_user()
