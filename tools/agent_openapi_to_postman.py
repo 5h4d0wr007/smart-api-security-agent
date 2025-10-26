@@ -1,6 +1,6 @@
 # tools/agent_openapi_to_postman.py
 import os, json, sys, subprocess, argparse, re, time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from mcp_client import McpHttp
 from openai import OpenAI
 
@@ -43,6 +43,7 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
         "Focus on authn/authz, IDOR, input validation, idempotency (409), rate limiting, and 2xx happy-paths. "
         "Return ONLY JSON."
     )
+
     tries = 0
     last_err = None
     while tries < 3:
@@ -146,7 +147,6 @@ def call_tool_with_aliases(mcp: McpHttp, names: List[str], args: Dict[str, Any])
     for name in names:
         try:
             res = mcp.call_tool(name, args)
-            # Some servers return {'error': {...}} in-band; treat as exception-like
             if isinstance(res, dict) and "error" in res:
                 last_err = RuntimeError(str(res["error"]))
                 continue
@@ -156,7 +156,6 @@ def call_tool_with_aliases(mcp: McpHttp, names: List[str], args: Dict[str, Any])
             if "not found" in msg.lower() or "-32601" in msg:
                 last_err = e
                 continue
-            # For invalid args (-32602), let caller decide; bubble up
             last_err = e
             break
     if last_err:
@@ -198,36 +197,27 @@ def collection_id_from_create(resp: Any) -> Optional[str]:
     return None
 
 def find_collection_id(mcp: McpHttp, workspace_id: str, name: str) -> Optional[str]:
-    # Try search (v2 full), then list (snake_case), then list (camelCase)
-    # 1) searchCollections (preferred when available)
+    # Prefer searchCollections (v2 full); args expect 'workspace' not 'workspaceId'
     try:
-        res = call_tool_with_aliases(mcp, ["searchCollections"], {"workspaceId": workspace_id, "query": name})
+        res = call_tool_with_aliases(mcp, ["searchCollections", "search_collections"], {"workspace": workspace_id, "query": name})
         if isinstance(res, dict) and isinstance(res.get("items"), list):
             for it in res["items"]:
                 if isinstance(it, dict) and it.get("name") == name:
                     return it.get("id")
     except Exception:
         pass
-    # 2) list_collections (v1/v2-snake)
-    try:
-        res = call_tool_with_aliases(mcp, ["list_collections"], {"workspaceId": workspace_id})
-        lst = []
-        if isinstance(res, dict) and isinstance(res.get("items"), list): lst = res["items"]
-        elif isinstance(res, list): lst = res
-        for it in lst:
-            if isinstance(it, dict) and it.get("name") == name:
-                return it.get("id")
-    except Exception:
-        pass
-    # 3) listCollections (camelCase variant)
-    try:
-        res = call_tool_with_aliases(mcp, ["listCollections"], {"workspaceId": workspace_id})
-        if isinstance(res, dict) and isinstance(res.get("items"), list):
-            for it in res["items"]:
+    # List variants
+    for tool in (["listCollections"], ["list_collections"]):
+        try:
+            res = call_tool_with_aliases(mcp, tool, {"workspace": workspace_id})
+            lst = []
+            if isinstance(res, dict) and isinstance(res.get("items"), list): lst = res["items"]
+            elif isinstance(res, list): lst = res
+            for it in lst:
                 if isinstance(it, dict) and it.get("name") == name:
                     return it.get("id")
-    except Exception:
-        pass
+        except Exception:
+            continue
     return None
 
 # ----------------------------------------------------------------------
@@ -275,22 +265,22 @@ def main():
 
     # 5) Idempotency: delete existing collection with same name (best-effort)
     try:
-        existing = call_tool_with_aliases(mcp, ["searchCollections"], {"workspaceId": workspace_id, "query": args.collection})
+        existing = call_tool_with_aliases(mcp, ["searchCollections", "search_collections"], {"workspace": workspace_id, "query": args.collection})
         if isinstance(existing, dict) and isinstance(existing.get("items"), list) and existing["items"]:
             cid0 = existing["items"][0].get("id")
             if cid0:
                 try:
-                    call_tool_with_aliases(mcp, ["deleteCollection", "delete_collection"], {"id": cid0})
+                    call_tool_with_aliases(mcp, ["deleteCollection", "delete_collection"], {"collection": cid0})
                 except Exception as e:
                     sys.stderr.write(f"[WARN] deleteCollection failed (continuing): {e}\n")
     except Exception:
         pass
 
-    # 6) Create collection WITH full object (works on v2 camelCase and v1 snake_case)
+    # 6) Create collection WITH full object; args use 'workspace' and 'collection'
     try:
-        created = call_tool_with_aliases(mcp, ["createCollection"], {"workspaceId": workspace_id, "collection": pm_collection})
+        created = call_tool_with_aliases(mcp, ["createCollection"], {"workspace": workspace_id, "collection": pm_collection})
     except Exception:
-        created = call_tool_with_aliases(mcp, ["create_collection"], {"workspaceId": workspace_id, "collection": pm_collection})
+        created = call_tool_with_aliases(mcp, ["create_collection"], {"workspace": workspace_id, "collection": pm_collection})
 
     cid = collection_id_from_create(created)
     if not cid:
@@ -298,32 +288,18 @@ def main():
     if not cid:
         raise SystemExit(f"Could not resolve created collection id. Response: {str(created)[:300]}")
 
-    # 7) Fetch (export) collection using get tool (there is NO exportCollection tool)
-    # Try camelCase first, then snake_case
+    # 7) Fetch (export) collection with get tool (no exportCollection in official server)
     try:
-        got = call_tool_with_aliases(mcp, ["getCollection"], {"id": cid, "format": "v2.1"})
+        got = call_tool_with_aliases(mcp, ["getCollection"], {"collection": cid})
     except Exception:
-        got = call_tool_with_aliases(mcp, ["get_collection"], {"id": cid})  # some servers ignore 'format'
+        got = call_tool_with_aliases(mcp, ["get_collection"], {"collection": cid})
 
     # Normalize shapes:
-    # - {"collection": {...}}
-    # - full collection object directly
-    # - message envelope already unwrapped by client
     collection_obj = None
     if isinstance(got, dict) and "collection" in got and isinstance(got["collection"], dict):
         collection_obj = got["collection"]
     elif isinstance(got, dict) and got.get("info") and got.get("item"):
         collection_obj = got
-    else:
-        # As a last resort, try list and pick by id
-        fallback = find_collection_id(mcp, workspace_id, args.collection)
-        if fallback == cid:
-            # Try another get without format hint
-            got2 = call_tool_with_aliases(mcp, ["getCollection", "get_collection"], {"id": cid})
-            if isinstance(got2, dict) and "collection" in got2 and isinstance(got2["collection"], dict):
-                collection_obj = got2["collection"]
-            elif isinstance(got2, dict) and got2.get("info") and got2.get("item"):
-                collection_obj = got2
 
     if not collection_obj:
         raise SystemExit(f"Unexpected getCollection response: {type(got)} {str(got)[:300]}")
@@ -331,7 +307,7 @@ def main():
     with open("generated-security-test.postman_collection.json","w") as f:
         json.dump(collection_obj, f, indent=2)
 
-    print("MCP: collection created & fetched.")
+    print("MCP: collection created & fetched (via getCollection).")
 
 if __name__ == "__main__":
     main()
