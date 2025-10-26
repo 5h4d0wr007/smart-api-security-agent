@@ -9,7 +9,7 @@ on:
 permissions:
   contents: read
   actions: read
-  security-events: write   # <-- REQUIRED for SARIF upload
+  security-events: write   # required for SARIF upload
 
 jobs:
   api-security:
@@ -25,16 +25,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install deps
         run: |
           set -e
+          # swagger-cli (deprecation warning is fine for our use)
           npm install -g @apidevtools/swagger-cli
+
+          # jq/curl
           sudo apt-get update -y
           sudo apt-get install -y jq curl
-          # oasdiff (static binary)
-          curl -fsSL -o /usr/local/bin/oasdiff https://github.com/Tufin/oasdiff/releases/download/v1.10.28/oasdiff_linux_amd64
-          chmod +x /usr/local/bin/oasdiff
-          # Python deps (if needed)
+
+          # ----- oasdiff (correct release asset, arch-aware) -----
+          OASDIFF_VERSION=1.10.28
+          UNAME_ARCH="$(uname -m)"
+          if [ "$UNAME_ARCH" = "x86_64" ]; then
+            OAS_ASSET="oasdiff_${OASDIFF_VERSION}_Linux_x86_64.tar.gz"
+          elif [ "$UNAME_ARCH" = "aarch64" ]; then
+            OAS_ASSET="oasdiff_${OASDIFF_VERSION}_Linux_arm64.tar.gz"
+          else
+            echo "Unsupported arch: $UNAME_ARCH"; exit 1
+          fi
+          curl -fsSL -o oasdiff.tgz "https://github.com/Tufin/oasdiff/releases/download/v${OASDIFF_VERSION}/${OAS_ASSET}"
+          tar -xzf oasdiff.tgz oasdiff
+          sudo mv oasdiff /usr/local/bin/oasdiff
+          sudo chmod +x /usr/local/bin/oasdiff
+          oasdiff --help >/dev/null
+
+          # Python libs
           python -m pip install --upgrade pip
           pip install requests openai
 
@@ -43,22 +65,23 @@ jobs:
           pip install flask
           python app/app.py &
           echo $! > app.pid
-          # sanity wait
+          # Give it a moment to bind
           sleep 2
 
       - name: Compute OpenAPI diff (base vs head)
         run: |
           set -euo pipefail
           cp openapi/api.v1.yaml .tmp.base.yaml || true
-          cp openapi/api.yaml .tmp.head.yaml
+          cp openapi/api.yaml    .tmp.head.yaml
           swagger-cli validate .tmp.base.yaml
           swagger-cli validate .tmp.head.yaml
           oasdiff diff --format json .tmp.base.yaml .tmp.head.yaml > diff.json
-          jq -r 'paths(scalars) as $p | {"path":$p,"value":getpath($p)}' diff.json | head -n 20 || true
+          echo "Wrote diff.json"
 
       - name: LLM → plan & create/overwrite collection via Postman MCP
         run: |
           python tools/agent_openapi_to_postman.py --base openapi/api.v1.yaml --head openapi/api.yaml
+          test -f generated-security-test.postman_collection.json
 
       - name: Postman CLI login (non-interactive)
         env:
@@ -67,6 +90,7 @@ jobs:
           postman login --with-api-key "$POSTMAN_API_KEY"
 
       - name: Run generated collection with Postman CLI (JSON reporter)
+        # keep job green so SARIF conversion + upload always run
         continue-on-error: true
         run: |
           postman collection run ./generated-security-test.postman_collection.json \
@@ -77,20 +101,24 @@ jobs:
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
-          jq '.runs[0].results | length as $n | "SARIF results: \($n)"' sarif.json
+          echo "Preview:"
+          python - <<'PY'
+import json; 
+j=json.load(open('sarif.json')); 
+print("results:", len(j.get("runs",[{}])[0].get("results",[])))
+PY
 
-      # ---------- This is the critical, final SARIF upload step ----------
+      # Upload SARIF results to Code scanning. 
+      # Skip for forked PRs to avoid permission errors.
       - name: Upload SARIF to GitHub Code Scanning
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
           category: openapi-postman-security
-          # associate to the PR head commit if this is a PR, else use current sha
           commit_sha: ${{ github.event.pull_request.head.sha || github.sha }}
-          ref: ${{ github.event.pull_request.head.ref || github.ref }}
+          ref:        ${{ github.event.pull_request.head.ref || github.ref }}
 
-      # Optional: keep artifacts so you can download & inspect locally
       - name: Upload artifacts (diff, plan, run, sarif, collection)
         uses: actions/upload-artifact@v4
         with:
