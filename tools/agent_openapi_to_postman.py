@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from mcp_client import McpHttp
 from openai import OpenAI
 
+# ----------------- small shell helper -----------------
 def run(cmd: list[str]) -> str:
     print("+", " ".join(cmd), flush=True)
     cp = subprocess.run(cmd, capture_output=True, text=True)
@@ -12,6 +13,7 @@ def run(cmd: list[str]) -> str:
         raise SystemExit(cp.returncode)
     return cp.stdout
 
+# ----------------- diff helpers -----------------
 def looks_empty_diff(diff_text: str) -> bool:
     try:
         d = json.loads(diff_text or "{}")
@@ -19,6 +21,7 @@ def looks_empty_diff(diff_text: str) -> bool:
     except Exception:
         return False
 
+# ----------------- LLM helpers -----------------
 def parse_json_strict(s: str) -> Any:
     return json.loads(s)
 
@@ -43,7 +46,6 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
         "Focus on authn/authz, IDOR, input validation, idempotency (409), rate limiting, and 2xx happy-paths. "
         "Return ONLY JSON."
     )
-
     tries = 0
     last_err = None
     while tries < 3:
@@ -88,6 +90,7 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
     sys.stderr.write(f"[WARN] LLM JSON parsing failed after retries: {last_err}\n")
     return []
 
+# ----------------- Postman collection builder -----------------
 def build_postman_collection(collection_name: str, plan: List[Dict[str,Any]]) -> Dict[str,Any]:
     def pm_item(endpoint: str, method: str, tests: List[str]) -> Dict[str,Any]:
         url = {"raw": "{{baseUrl}}"+endpoint, "host": ["{{baseUrl}}"], "path": endpoint.lstrip("/").split("/")}
@@ -136,12 +139,11 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str,Any]]) ->
         ]
     }
 
-# ---------- MCP helpers (tool aliasing & shape normalization) ----------
-
+# ----------------- MCP helpers (v2 camelCase tools, with careful params) -----------------
 def call_tool_with_aliases(mcp: McpHttp, names: List[str], args: Dict[str, Any]) -> Any:
     """
-    Try a list of tool names until one succeeds (handles v2 camelCase and v1 snake_case).
-    Treat 'Tool ... not found' or JSON-RPC -32601 as a miss and continue.
+    Try tools in order; treat 'Tool ... not found' / -32601 as miss and continue.
+    Bubble up -32602 (invalid args) so we can fix param shapes.
     """
     last_err = None
     for name in names:
@@ -197,31 +199,29 @@ def collection_id_from_create(resp: Any) -> Optional[str]:
     return None
 
 def find_collection_id(mcp: McpHttp, workspace_id: str, name: str) -> Optional[str]:
-    # Prefer searchCollections (v2 full); args expect 'workspace' not 'workspaceId'
+    # Prefer searchCollections; expects 'workspace' (string) + 'query'
     try:
-        res = call_tool_with_aliases(mcp, ["searchCollections", "search_collections"], {"workspace": workspace_id, "query": name})
+        res = call_tool_with_aliases(mcp, ["searchCollections"], {"workspace": workspace_id, "query": name})
         if isinstance(res, dict) and isinstance(res.get("items"), list):
             for it in res["items"]:
                 if isinstance(it, dict) and it.get("name") == name:
                     return it.get("id")
     except Exception:
         pass
-    # List variants
-    for tool in (["listCollections"], ["list_collections"]):
-        try:
-            res = call_tool_with_aliases(mcp, tool, {"workspace": workspace_id})
-            lst = []
-            if isinstance(res, dict) and isinstance(res.get("items"), list): lst = res["items"]
-            elif isinstance(res, list): lst = res
-            for it in lst:
-                if isinstance(it, dict) and it.get("name") == name:
-                    return it.get("id")
-        except Exception:
-            continue
+    # listCollections as a fallback
+    try:
+        res = call_tool_with_aliases(mcp, ["listCollections"], {"workspace": workspace_id})
+        lst = []
+        if isinstance(res, dict) and isinstance(res.get("items"), list): lst = res["items"]
+        elif isinstance(res, list): lst = res
+        for it in lst:
+            if isinstance(it, dict) and it.get("name") == name:
+                return it.get("id")
+    except Exception:
+        pass
     return None
 
-# ----------------------------------------------------------------------
-
+# ----------------- main -----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="openapi/api.v1.yaml")
@@ -237,7 +237,7 @@ def main():
     diff_json = run(["oasdiff", "diff", "--format", "json", args.base, args.head])
     with open(args.diff, "w") as f: f.write(diff_json)
 
-    # 2) LLM → plan
+    # 2) LLM → plan (robust)
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     if looks_empty_diff(diff_json):
         plan: List[Dict[str, Any]] = []
@@ -245,12 +245,12 @@ def main():
         plan = llm_plan_from_diff(client, diff_json)
     with open(args.plan, "w") as f: json.dump(plan, f, indent=2)
 
-    # 3) Build collection JSON (v2.1)
+    # 3) Build collection (v2.1)
     pm_collection = build_postman_collection(args.collection, plan)
 
-    # 4) Postman MCP: find workspace
+    # 4) Postman MCP (Full server): find workspace
     mcp = McpHttp(os.environ["POSTMAN_MCP_URL"], os.environ["POSTMAN_API_KEY"])
-    workspaces_obj = call_tool_with_aliases(mcp, ["getWorkspaces", "get_workspaces"], {})
+    workspaces_obj = call_tool_with_aliases(mcp, ["getWorkspaces"], {})
     if workspaces_obj is None:
         raise SystemExit("MCP getWorkspaces returned no content. Check POSTMAN_MCP_URL, API key, and network.")
     ws_items = normalize_workspaces(workspaces_obj)
@@ -265,34 +265,27 @@ def main():
 
     # 5) Idempotency: delete existing collection with same name (best-effort)
     try:
-        existing = call_tool_with_aliases(mcp, ["searchCollections", "search_collections"], {"workspace": workspace_id, "query": args.collection})
+        existing = call_tool_with_aliases(mcp, ["searchCollections"], {"workspace": workspace_id, "query": args.collection})
         if isinstance(existing, dict) and isinstance(existing.get("items"), list) and existing["items"]:
             cid0 = existing["items"][0].get("id")
             if cid0:
                 try:
-                    call_tool_with_aliases(mcp, ["deleteCollection", "delete_collection"], {"collection": cid0})
+                    call_tool_with_aliases(mcp, ["deleteCollection"], {"collectionId": cid0})
                 except Exception as e:
                     sys.stderr.write(f"[WARN] deleteCollection failed (continuing): {e}\n")
     except Exception:
         pass
 
-    # 6) Create collection WITH full object; args use 'workspace' and 'collection'
-    try:
-        created = call_tool_with_aliases(mcp, ["createCollection"], {"workspace": workspace_id, "collection": pm_collection})
-    except Exception:
-        created = call_tool_with_aliases(mcp, ["create_collection"], {"workspace": workspace_id, "collection": pm_collection})
-
+    # 6) Create collection WITH full object; params: workspace (string), collection (object)
+    created = call_tool_with_aliases(mcp, ["createCollection"], {"workspace": workspace_id, "collection": pm_collection})
     cid = collection_id_from_create(created)
     if not cid:
         cid = find_collection_id(mcp, workspace_id, args.collection)
     if not cid:
         raise SystemExit(f"Could not resolve created collection id. Response: {str(created)[:300]}")
 
-    # 7) Fetch (export) collection with get tool (no exportCollection in official server)
-    try:
-        got = call_tool_with_aliases(mcp, ["getCollection"], {"collection": cid})
-    except Exception:
-        got = call_tool_with_aliases(mcp, ["get_collection"], {"collection": cid})
+    # 7) Fetch collection JSON (there is no exportCollection tool). Param: collectionId (string)
+    got = call_tool_with_aliases(mcp, ["getCollection"], {"collectionId": cid})
 
     # Normalize shapes:
     collection_obj = None
