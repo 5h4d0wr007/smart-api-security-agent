@@ -1,117 +1,64 @@
-name: OpenAPI → Security tests with Postman MCP
+name: OpenAPI → Postman MCP → Security tests
 
 on:
+  push:
+    branches: [ main ]
   pull_request:
-    paths:
-      - "openapi/**.y*ml"
-      - "openapi/**.json"
-      - "app/**"
-      - "tools/**"
+    branches: [ main ]
 
 permissions:
   contents: read
-  security-events: write
-  actions: read   # needed by upload-sarif to query workflow run
-
-env:
-  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
-  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
-  POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
+  actions: read
+  security-events: write   # <-- REQUIRED for SARIF upload
 
 jobs:
-  test-on-openapi-change:
+  api-security:
     runs-on: ubuntu-latest
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+      POSTMAN_MCP_URL: https://mcp.postman.com/mcp
+      POSTMAN_WORKSPACE_NAME: Security Demo
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Setup Node (for swagger-cli)
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install Python deps
+      - name: Install deps
         run: |
+          set -e
+          npm install -g @apidevtools/swagger-cli
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+          # oasdiff (static binary)
+          curl -fsSL -o /usr/local/bin/oasdiff https://github.com/Tufin/oasdiff/releases/download/v1.10.28/oasdiff_linux_amd64
+          chmod +x /usr/local/bin/oasdiff
+          # Python deps (if needed)
           python -m pip install --upgrade pip
-          pip install -r app/requirements.txt
-          pip install openai requests
-
-      - name: Install CLI tooling (Postman CLI + swagger-cli)
-        run: |
-          # Postman CLI (official)
-          curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
-          # OpenAPI validator
-          npm i -g @apidevtools/swagger-cli@4
-          postman --version
-          swagger-cli --version
-
-      - name: Install oasdiff (Linux binary, pinned)
-        run: |
-          set -euo pipefail
-          OASDIFF_VERSION="v1.10.28"
-          TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
-          URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
-          URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
-          echo "Downloading oasdiff ${OASDIFF_VERSION}…"
-          if ! curl -fL "$URL_PRIMARY" -o oasdiff.tgz; then
-            echo "Primary URL failed, trying fallback…"
-            curl -fL "$URL_FALLBACK" -o oasdiff.tgz
-          fi
-          tar -xzf oasdiff.tgz
-          chmod +x oasdiff
-          sudo mv oasdiff /usr/local/bin/oasdiff
+          pip install requests openai
 
       - name: Start sample app (localhost:8000)
         run: |
+          pip install flask
           python app/app.py &
           echo $! > app.pid
-          # Warm up; just need the server responding
-          for i in {1..20}; do
-            if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
-              echo "App is up"
-              break
-            fi
-            sleep 1
-          done
+          # sanity wait
+          sleep 2
 
       - name: Compute OpenAPI diff (base vs head)
         run: |
           set -euo pipefail
-          BASE=origin/${{ github.base_ref }}
-          HEAD=origin/${{ github.head_ref }}
-          mkdir -p .tmp
-          FILE=$(git diff --name-only "$BASE...$HEAD" | grep -E '^openapi/.*\.(ya?ml|json)$' | head -n1 || true)
-          if [ -z "${FILE:-}" ]; then
-            echo "No OpenAPI changes detected."
-            echo '{}' > diff.json
-          else
-            git show "$BASE:$FILE" > .tmp/base.yaml || cp openapi/api.v1.yaml .tmp/base.yaml
-            git show "$HEAD:$FILE" > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
-            swagger-cli validate .tmp/base.yaml
-            swagger-cli validate .tmp/head.yaml
-            oasdiff diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
-          fi
-          echo "Wrote diff.json"
+          cp openapi/api.v1.yaml .tmp.base.yaml || true
+          cp openapi/api.yaml .tmp.head.yaml
+          swagger-cli validate .tmp.base.yaml
+          swagger-cli validate .tmp.head.yaml
+          oasdiff diff --format json .tmp.base.yaml .tmp.head.yaml > diff.json
+          jq -r 'paths(scalars) as $p | {"path":$p,"value":getpath($p)}' diff.json | head -n 20 || true
 
-      - name: LLM → plan & create/overwrite collection via official Postman MCP
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+      - name: LLM → plan & create/overwrite collection via Postman MCP
         run: |
-          python tools/agent_openapi_to_postman.py \
-            --base openapi/api.v1.yaml \
-            --head openapi/api.yaml \
-            --diff diff.json \
-            --collection "security test collection" \
-            --plan plan.json
+          python tools/agent_openapi_to_postman.py --base openapi/api.v1.yaml --head openapi/api.yaml
 
       - name: Postman CLI login (non-interactive)
         env:
@@ -124,21 +71,38 @@ jobs:
         run: |
           postman collection run ./generated-security-test.postman_collection.json \
             --reporters cli,json \
-            --reporter-json-export run.json
+            --reporter-json-export run.json \
+          || true
 
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
+          jq '.runs[0].results | length as $n | "SARIF results: \($n)"' sarif.json
 
-      # Upload SARIF only when the PR is from the same repository (not a fork)
+      # ---------- This is the critical, final SARIF upload step ----------
       - name: Upload SARIF to GitHub Code Scanning
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
           category: openapi-postman-security
+          # associate to the PR head commit if this is a PR, else use current sha
+          commit_sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.ref || github.ref }}
 
-      - name: Stop sample app
+      # Optional: keep artifacts so you can download & inspect locally
+      - name: Upload artifacts (diff, plan, run, sarif, collection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-security-output
+          path: |
+            diff.json
+            plan.json
+            run.json
+            sarif.json
+            generated-security-test.postman_collection.json
+
+      - name: Stop app
         if: always()
         run: |
-          kill "$(cat app.pid)" 2>/dev/null || true
+          if [ -f app.pid ]; then kill $(cat app.pid) || true; fi
