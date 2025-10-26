@@ -1,3 +1,4 @@
+# .github/workflows/openapi-security-mcp.yml
 name: OpenAPI → Security tests with Postman MCP
 
 on:
@@ -45,43 +46,44 @@ jobs:
 
       - name: Install CLI tooling (Postman CLI + swagger-cli)
         run: |
-          # Postman CLI (official)
+          # Postman CLI (official installer)
           curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
           # OpenAPI validator
           npm i -g @apidevtools/swagger-cli@4
           postman --version
           swagger-cli --version
 
-      # Robust, pinned install of oasdiff without hitting the GitHub API
+      # Pin a known-good oasdiff release and install the Linux binary.
+      # NOTE: oasdiff has commands like `diff`, `breaking`, `changelog`.
+      # There is NO `version` subcommand; use `oasdiff --help` if you need a check.
       - name: Install oasdiff (Linux binary, pinned)
         run: |
           set -euo pipefail
-          OASDIFF_VERSION="v1.10.28"   # known good; update when you want
+          OASDIFF_VERSION="v1.10.28"
           TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
-
-          # Try old org (Tufin) first, then new org (oasdiff) as fallback
-          URL1="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
-          URL2="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
 
           echo "Downloading oasdiff ${OASDIFF_VERSION}…"
-          if ! curl -fL "$URL1" -o oasdiff.tgz; then
-            echo "Primary URL failed, trying fallback org…"
-            curl -fL "$URL2" -o oasdiff.tgz
+          if ! curl -fL "$URL_PRIMARY" -o oasdiff.tgz; then
+            echo "Primary URL failed, trying fallback…"
+            curl -fL "$URL_FALLBACK" -o oasdiff.tgz
           fi
 
           tar -xzf oasdiff.tgz
           chmod +x oasdiff
           sudo mv oasdiff /usr/local/bin/oasdiff
-          oasdiff version
+          oasdiff --help | head -n 5
 
       - name: Start sample app (localhost:8000)
         run: |
           python app/app.py &
           echo $! > app.pid
-          # simple warmup (endpoint returns 401 if no token, that's fine; we only check readiness)
+          # Warm up; /pets returns 401 without token which is fine—just wait for a response
           for i in {1..20}; do
             if curl -fsS http://127.0.0.1:8000/pets >/dev/null 2>&1 || curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
-              echo "App is up"; break
+              echo "App is up"
+              break
             fi
             sleep 1
           done
@@ -101,6 +103,7 @@ jobs:
             git show "$HEAD:$FILE" > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
             swagger-cli validate .tmp/base.yaml
             swagger-cli validate .tmp/head.yaml
+            # JSON output supported by oasdiff (see docs)
             oasdiff diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
           fi
           echo "Wrote diff.json"
