@@ -124,8 +124,7 @@ jobs:
         run: |
           postman collection run ./generated-security-test.postman_collection.json \
             --reporters cli,json \
-            --reporter-json-export run.json \
-            --no-telemetry
+            --reporter-json-export run.json
 
       - name: Convert Postman report → SARIF
         run: |
