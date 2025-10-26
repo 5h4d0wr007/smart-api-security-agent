@@ -1,5 +1,5 @@
 openapi: 3.0.3
-info: { title: Pets Demo API, version: 1.0.0 }
+info: { title: Pets Demo API, version: 1.1.0 }
 servers: [{ url: http://127.0.0.1:8000 }]
 paths:
   /pets:
@@ -17,18 +17,34 @@ paths:
     get:
       summary: Get pet
       security: [ { bearerAuth: [] } ]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, pattern: '^[a-f0-9-]{36}$' } }]
       responses: { '200': { description: OK }, '404': { description: Not found } }
     patch:
       summary: Update pet
       security: [ { bearerAuth: [] } ]
-      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, pattern: '^[a-f0-9-]{36}$' } }]
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: '#/components/schemas/PetUpdate' }
       responses: { '200': { description: OK } }
+  /pets/{id}/transfer:
+    post:
+      summary: Transfer pet ownership
+      security: [ { bearerAuth: [] } ]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, pattern: '^[a-f0-9-]{36}$' } }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toUserId, transferId]
+              properties:
+                toUserId: { type: string }
+                transferId: { type: string }
+      responses: { '202': { description: Accepted } }
 components:
   securitySchemes: { bearerAuth: { type: http, scheme: bearer } }
   schemas:
@@ -36,10 +52,10 @@ components:
       type: object
       required: [name, type]
       properties:
-        name: { type: string }
+        name: { type: string, minLength: 1 }
         type: { type: string, enum: [dog, cat, bird] }
     PetUpdate:
       type: object
       properties:
-        name: { type: string }
+        name: { type: string, minLength: 1 }
         type: { type: string, enum: [dog, cat, bird] }
