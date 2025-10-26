@@ -1,8 +1,10 @@
+# tools/agent_openapi_to_postman.py
 import os, json, sys, subprocess, argparse, re, time
 from typing import Any, Dict, List, Optional
 from mcp_client import McpHttp
 from openai import OpenAI
 
+# ----------------- small shell helper -----------------
 def run(cmd: list[str]) -> str:
     print("+", " ".join(cmd), flush=True)
     cp = subprocess.run(cmd, capture_output=True, text=True)
@@ -11,6 +13,7 @@ def run(cmd: list[str]) -> str:
         raise SystemExit(cp.returncode)
     return cp.stdout
 
+# ----------------- diff helpers -----------------
 def looks_empty_diff(diff_text: str) -> bool:
     try:
         d = json.loads(diff_text or "{}")
@@ -18,6 +21,7 @@ def looks_empty_diff(diff_text: str) -> bool:
     except Exception:
         return False
 
+# ----------------- LLM helpers -----------------
 def parse_json_strict(s: str) -> Any:
     return json.loads(s)
 
@@ -66,63 +70,151 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
                         break
             return data if isinstance(data, list) else []
         except Exception as e:
-            sys.stderr.write(f"[WARN] parse fail ({e}), retrying...\n")
+            sys.stderr.write(f"[WARN] LLM parse failed ({e}), retrying...\n")
             time.sleep(1)
     return []
 
-def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -> Dict[str, Any]:
+# ----------------- Postman collection builder (robust tests) -----------------
+def build_postman_collection(collection_name: str, plan: List[Dict[str,Any]]) -> Dict[str,Any]:
     def normalize_endpoint(ep: str) -> str:
         ep = ep or "/"
         if not ep.startswith("/"):
             ep = "/" + ep
-        ep = re.sub(r"\{([^}/]+)\}", r"{{\1}}", ep)
-        return ep
+        # Turn /pets/{id}/transfer -> /pets/{{id}}/transfer
+        return re.sub(r"\{([^}/]+)\}", r"{{\1}}", ep)
 
-    def pm_item(endpoint: str, method: str, tests: List[str]) -> Dict[str, Any]:
-        endpoint = normalize_endpoint(endpoint)
+    def add_expect_from_keywords(script: List[str], s: str) -> bool:
+        s_l = s.lower()
+        if "unauth" in s_l or "401" in s_l:
+            script.append('expect(401, "Unauthenticated -> 401");'); return True
+        if "forbidden" in s_l or "role" in s_l or "403" in s_l or "bfla" in s_l:
+            script.append('expect(403, "Forbidden -> 403");'); return True
+        if "idor" in s_l or "bola" in s_l or "404" in s_l or "not found" in s_l:
+            script.append('expect(404, "Not found -> 404");'); return True
+        if "invalid" in s_l or "bad request" in s_l or "400" in s_l:
+            script.append('expect(400, "Invalid -> 400");'); return True
+        if "conflict" in s_l or "replay" in s_l or "409" in s_l:
+            script.append('expect(409, "Replay/Conflict -> 409");'); return True
+        if "accepted" in s_l or "202" in s_l:
+            script.append('expect(202, "Accepted -> 202");'); return True
+        if "created" in s_l or "201" in s_l:
+            script.append('expect(201, "Created -> 201");'); return True
+        if "ok" in s_l or "success" in s_l or "200" in s_l:
+            script.append('expect(200, "OK -> 200");'); return True
+        return False
+
+    def add_expect_from_dict(script: List[str], d: Dict[str, Any]):
+        # Supported shapes:
+        # {"name":"Unauthenticated -> 401","expect":401}
+        # {"label":"Forbidden -> 403","expectStatus":403}
+        # {"status":404}
+        # {"type":"unauth"|"bfla"|"bola"|"ok"|"created"|"accepted"|"invalid"|"conflict"}
+        label = d.get("name") or d.get("label") or ""
+        status = d.get("expect") or d.get("expectStatus") or d.get("status")
+
+        type_hint = str(d.get("type") or "").lower()
+        type_map = {
+            "unauth": (401, "Unauthenticated -> 401"),
+            "authn": (401, "Unauthenticated -> 401"),
+            "bfla": (403, "Forbidden -> 403"),
+            "forbidden": (403, "Forbidden -> 403"),
+            "authz": (403, "Forbidden -> 403"),
+            "bola": (404, "Not found -> 404"),
+            "idor": (404, "Not found -> 404"),
+            "invalid": (400, "Invalid -> 400"),
+            "badrequest": (400, "Invalid -> 400"),
+            "conflict": (409, "Replay/Conflict -> 409"),
+            "replay": (409, "Replay/Conflict -> 409"),
+            "accepted": (202, "Accepted -> 202"),
+            "created": (201, "Created -> 201"),
+            "ok": (200, "OK -> 200"),
+            "success": (200, "OK -> 200"),
+        }
+        if type_hint in type_map:
+            st, lab = type_map[type_hint]
+            script.append(f'expect({st}, "{lab}");')
+            return
+
+        if isinstance(status, (int, float)) and int(status) in {200,201,202,400,401,403,404,409}:
+            st = int(status)
+            lab = label or {
+                200:"OK -> 200", 201:"Created -> 201", 202:"Accepted -> 202",
+                400:"Invalid -> 400", 401:"Unauthenticated -> 401", 403:"Forbidden -> 403",
+                404:"Not found -> 404", 409:"Replay/Conflict -> 409"
+            }.get(st, f"Expect -> {st}")
+            script.append(f'expect({st}, "{lab}");')
+            return
+
+        if label and add_expect_from_keywords(script, label):
+            return
+
+        script.append('pm.test("Generic check", () => pm.expect([200,201,202,400,401,403,404,409]).to.include(code));')
+
+    def pm_item(endpoint: str, method: str, tests: Any) -> Dict[str,Any]:
+        endpoint = normalize_endpoint(endpoint or "/")
         path_parts = endpoint.lstrip("/").split("/") if endpoint != "/" else []
         url = {"raw": "{{baseUrl}}" + endpoint, "host": ["{{baseUrl}}"], "path": path_parts}
         headers = [
-            {"key": "Authorization", "value": "Bearer {{token}}", "type": "text"},
-            {"key": "Content-Type", "value": "application/json", "type": "text"},
+            {"key":"Authorization","value":"Bearer {{token}}","type":"text"},
+            {"key":"Content-Type","value":"application/json","type":"text"},
         ]
         script = [
             "const code = pm.response.code;",
             "function expect(c, name){ pm.test(name, () => pm.expect(code).to.eql(c)); }",
         ]
-        for t in tests or []:
-            s = t.lower()
-            if "unauth" in s: script.append('expect(401, "Unauthenticated -> 401");')
-            elif "forbidden" in s or "role" in s: script.append('expect(403, "Forbidden -> 403");')
-            elif "invalid" in s or "bad request" in s: script.append('expect(400, "Invalid -> 400");')
-            elif "conflict" in s: script.append('expect(409, "Conflict -> 409");')
-            elif "not found" in s: script.append('expect(404, "Not found -> 404");')
-            elif "202" in s: script.append('expect(202, "Accepted -> 202");')
-            elif "201" in s: script.append('expect(201, "Created -> 201");')
-            elif "200" in s: script.append('expect(200, "OK -> 200");')
+
+        seq = tests if isinstance(tests, list) else ([] if tests is None else [tests])
+        added_any = False
+        for t in seq:
+            if isinstance(t, str):
+                if add_expect_from_keywords(script, t):
+                    added_any = True
+                else:
+                    m = re.search(r"\b(200|201|202|400|401|403|404|409)\b", t)
+                    if m:
+                        add_expect_from_dict(script, {"status": int(m.group(1)), "label": t})
+                        added_any = True
+            elif isinstance(t, (int, float)):
+                add_expect_from_dict(script, {"status": int(t)})
+                added_any = True
+            elif isinstance(t, dict):
+                add_expect_from_dict(script, t)
+                added_any = True
+
+        if not added_any:
+            script.append('pm.test("Generic check", () => pm.expect([200,201,202,400,401,403,404,409]).to.include(code));')
+
         return {
             "name": f"{method} {endpoint}",
-            "request": {"method": method, "header": headers,
-                        "url": url, "body": {"mode": "raw", "raw": "{}"}},
-            "event": [{"listen": "test", "script": {"type": "text/javascript", "exec": script}}]
+            "request": {"method": method, "header": headers, "url": url, "body": {"mode":"raw","raw":"{}"}},
+            "event": [{"listen":"test","script":{"type":"text/javascript","exec":script}}]
         }
 
-    items = [pm_item(r.get("endpoint"), (r.get("method") or "GET").upper(), r.get("tests"))
-             for r in plan if r.get("changeType") != "deleted"]
+    # Build items from plan (tolerant to odd shapes)
+    items: List[Dict[str,Any]] = []
+    for r in plan or []:
+        if not isinstance(r, dict):
+            continue
+        if (r.get("changeType") or "").lower() == "deleted":
+            continue
+        endpoint = r.get("endpoint") or "/"
+        method = (r.get("method") or "GET").upper()
+        items.append(pm_item(endpoint, method, r.get("tests")))
 
     if not items:
-        items = [pm_item("/", "GET", ["OK -> 200"])]
+        items.append(pm_item("/", "GET", ["OK -> 200"]))
 
     return {
         "info": {"name": collection_name, "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
         "item": items,
         "variable": [
-            {"key": "baseUrl", "value": "http://127.0.0.1:8000"},
-            {"key": "token", "value": "token-user-u1"},
-            {"key": "id", "value": "p1"}
+            {"key":"baseUrl","value":"http://127.0.0.1:8000"},
+            {"key":"token","value":"token-user-u1"},
+            {"key":"id","value":"p1"}
         ]
     }
 
+# ---------- MCP helpers ----------
 def call_tool(mcp: McpHttp, name: str, args: Dict[str, Any]) -> Any:
     return mcp.call_tool(name, args)
 
@@ -150,15 +242,18 @@ def main():
     ap.add_argument("--plan", default="plan.json")
     args = ap.parse_args()
 
+    # Validate & diff
     run(["swagger-cli", "validate", args.base])
     run(["swagger-cli", "validate", args.head])
     diff_json = run(["oasdiff", "diff", "--format", "json", args.base, args.head])
     with open(args.diff, "w") as f: f.write(diff_json)
 
+    # LLM → plan
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     plan = [] if looks_empty_diff(diff_json) else llm_plan_from_diff(client, diff_json)
     with open(args.plan, "w") as f: json.dump(plan, f, indent=2)
 
+    # Build collection
     pm_collection = build_postman_collection(args.collection, plan)
 
     # Postman MCP integration
@@ -193,7 +288,7 @@ def main():
         json.dump(collection_obj, f, indent=2)
     print("MCP: collection created & fetched.")
 
-    # Ensure environment (tokens)
+    # Ensure environment (tokens & defaults)
     env_name = "Local Security Test"
     env_vars = [
         {"key": "baseUrl", "value": "http://127.0.0.1:8000"},
@@ -204,6 +299,7 @@ def main():
     ]
     try:
         env = {"name": env_name, "values": env_vars}
+        # Best effort create; ignore if it already exists
         call_tool(mcp, "createEnvironment", {"workspace": workspace_id, "environment": env})
     except Exception as e:
         print(f"[WARN] could not create env: {e}")
