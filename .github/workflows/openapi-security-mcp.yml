@@ -1,29 +1,39 @@
 name: OpenAPI → Postman MCP → Security tests
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  push:        # run on any branch push
+  pull_request:  # run on any PR (not just main)
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read
   actions: read
-  security-events: write   # required for SARIF upload
+  security-events: write   # needed to upload SARIF
 
 jobs:
   api-security:
     runs-on: ubuntu-latest
 
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
       POSTMAN_MCP_URL: https://mcp.postman.com/mcp
       POSTMAN_WORKSPACE_NAME: Security Demo
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Discover secrets availability (gate for forks)
+        id: gates
+        shell: bash
+        run: |
+          has_openai=false
+          has_postman=false
+          if [ -n "${{ secrets.OPENAI_API_KEY }}" ];   then has_openai=true; fi
+          if [ -n "${{ secrets.POSTMAN_API_KEY }}" ];  then has_postman=true; fi
+          if $has_openai && $has_postman; then echo "has_secrets=true"  >> $GITHUB_OUTPUT; else echo "has_secrets=false" >> $GITHUB_OUTPUT; fi
+          echo "has_openai=$has_openai"
+          echo "has_postman=$has_postman"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,14 +43,12 @@ jobs:
       - name: Install deps
         run: |
           set -e
-          # swagger-cli (deprecation warning is fine for our use)
           npm install -g @apidevtools/swagger-cli
 
-          # jq/curl
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
-          # ----- oasdiff (correct release asset, arch-aware) -----
+          # oasdiff (arch-aware)
           OASDIFF_VERSION=1.10.28
           UNAME_ARCH="$(uname -m)"
           if [ "$UNAME_ARCH" = "x86_64" ]; then
@@ -56,7 +64,6 @@ jobs:
           sudo chmod +x /usr/local/bin/oasdiff
           oasdiff --help >/dev/null
 
-          # Python libs
           python -m pip install --upgrade pip
           pip install requests openai
 
@@ -65,7 +72,6 @@ jobs:
           pip install flask
           python app/app.py &
           echo $! > app.pid
-          # Give it a moment to bind
           sleep 2
 
       - name: Compute OpenAPI diff (base vs head)
@@ -79,18 +85,30 @@ jobs:
           echo "Wrote diff.json"
 
       - name: LLM → plan & create/overwrite collection via Postman MCP
+        if: steps.gates.outputs.has_secrets == 'true'
+        env:
+          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+          POSTMAN_MCP_URL: ${{ env.POSTMAN_MCP_URL }}
+          POSTMAN_WORKSPACE_NAME: ${{ env.POSTMAN_WORKSPACE_NAME }}
         run: |
           python tools/agent_openapi_to_postman.py --base openapi/api.v1.yaml --head openapi/api.yaml
           test -f generated-security-test.postman_collection.json
 
+      - name: Explain why LLM/Postman steps were skipped
+        if: steps.gates.outputs.has_secrets != 'true'
+        run: |
+          echo "::warning::Secrets not available (likely a forked PR). Skipping LLM/MCP/Postman run. The workflow still runs so you can see status, but no SARIF will be uploaded."
+
       - name: Postman CLI login (non-interactive)
+        if: steps.gates.outputs.has_secrets == 'true'
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
           postman login --with-api-key "$POSTMAN_API_KEY"
 
       - name: Run generated collection with Postman CLI (JSON reporter)
-        # keep job green so SARIF conversion + upload always run
+        if: steps.gates.outputs.has_secrets == 'true'
         continue-on-error: true
         run: |
           postman collection run ./generated-security-test.postman_collection.json \
@@ -99,19 +117,17 @@ jobs:
           || true
 
       - name: Convert Postman report → SARIF
+        if: steps.gates.outputs.has_secrets == 'true'
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
-          echo "Preview:"
           python - <<'PY'
 import json; 
 j=json.load(open('sarif.json')); 
-print("results:", len(j.get("runs",[{}])[0].get("results",[])))
+print("SARIF results:", len(j.get("runs",[{}])[0].get("results",[])))
 PY
 
-      # Upload SARIF results to Code scanning. 
-      # Skip for forked PRs to avoid permission errors.
       - name: Upload SARIF to GitHub Code Scanning
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        if: steps.gates.outputs.has_secrets == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
@@ -120,6 +136,7 @@ PY
           ref:        ${{ github.event.pull_request.head.ref || github.ref }}
 
       - name: Upload artifacts (diff, plan, run, sarif, collection)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: api-security-output
