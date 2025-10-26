@@ -1,6 +1,6 @@
 # tools/agent_openapi_to_postman.py
 import os, json, sys, subprocess, argparse, re, time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from mcp_client import McpHttp
 from openai import OpenAI
 
@@ -15,7 +15,6 @@ def run(cmd: list[str]) -> str:
 def looks_empty_diff(diff_text: str) -> bool:
     try:
         d = json.loads(diff_text or "{}")
-        # empty or all keys empty
         return d == {} or all(not d.get(k) for k in d.keys())
     except Exception:
         return False
@@ -24,15 +23,12 @@ def parse_json_strict(s: str) -> Any:
     return json.loads(s)
 
 def extract_json_from_fences(s: str) -> Any:
-    # Try ```json ... ``` blocks
     m = re.search(r"```json\s*([\s\S]*?)```", s, re.IGNORECASE)
     if m:
         return json.loads(m.group(1))
-    # Try any {...} top-level JSON object
     m = re.search(r"(\{[\s\S]*\})", s)
     if m:
         return json.loads(m.group(1))
-    # Try any [...] array
     m = re.search(r"(\[[\s\S]*\])", s)
     if m:
         return json.loads(m.group(1))
@@ -53,7 +49,6 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
     while tries < 3:
         tries += 1
         try:
-            # Prefer JSON mode; model may return an object wrapper (normalize below)
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 temperature=0.1,
@@ -66,8 +61,7 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
             if isinstance(data, dict) and "items" in data:
                 data = data["items"]
             if isinstance(data, dict):
-                # try to coerce to array if the model returned {plan:[...]} etc.
-                for k, v in data.items():
+                for _, v in data.items():
                     if isinstance(v, list):
                         data = v
                         break
@@ -76,7 +70,6 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
             return data
         except Exception as e:
             last_err = e
-            # Fallback: no JSON mode, extract from fences
             try:
                 resp = client.chat.completions.create(
                     model="gpt-4o-mini",
@@ -135,18 +128,61 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str,Any]]) ->
         method = (r.get("method") or "GET").upper()
         items.append(pm_item(endpoint, method, r.get("tests") or []))
 
-    # If plan is empty, include a tiny health-check so the run still produces output
     if not items:
         items.append(pm_item("/", "GET", ["OK -> 200"]))
 
     return {
-        "info": {"name": collection_name, "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+        "info": {
+            "name": collection_name,
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+        },
         "item": items,
         "variable": [
             {"key":"baseUrl","value":"http://127.0.0.1:8000"},
             {"key":"token","value":"demo-token"}
         ]
     }
+
+def _normalize_workspace_list(workspaces_obj: Any) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    if isinstance(workspaces_obj, dict):
+        if isinstance(workspaces_obj.get("items"), list):
+            items = workspaces_obj["items"]
+        elif isinstance(workspaces_obj.get("workspaces"), list):
+            items = workspaces_obj["workspaces"]
+        elif isinstance(workspaces_obj.get("content"), list):
+            texts = [c.get("text","") for c in workspaces_obj["content"] if isinstance(c, dict)]
+            joined = "\n".join(texts)
+            try:
+                parsed = json.loads(joined)
+                if isinstance(parsed, dict):
+                    if isinstance(parsed.get("items"), list):
+                        items = parsed["items"]
+                    elif isinstance(parsed.get("workspaces"), list):
+                        items = parsed["workspaces"]
+            except Exception:
+                pass
+        else:
+            if workspaces_obj.get("id") and workspaces_obj.get("name"):
+                items = [workspaces_obj]
+    elif isinstance(workspaces_obj, list):
+        items = [w for w in workspaces_obj if isinstance(w, dict)]
+    return items
+
+def _extract_collection_id_from_create(resp: Any) -> Optional[str]:
+    # Handle multiple shapes:
+    # - {"collection":{"id":"...","uid":"..."}}
+    # - {"id":"..."} or {"collectionId":"..."}
+    # - Message envelope already unwrapped by client; still be defensive.
+    if not isinstance(resp, dict):
+        return None
+    if isinstance(resp.get("collection"), dict) and resp["collection"].get("id"):
+        return resp["collection"]["id"]
+    if resp.get("id"):
+        return resp["id"]
+    if resp.get("collectionId"):
+        return resp["collectionId"]
+    return None
 
 def main():
     ap = argparse.ArgumentParser()
@@ -157,7 +193,7 @@ def main():
     ap.add_argument("--plan", default="plan.json")
     args = ap.parse_args()
 
-    # 1) Validate & diff (also done in CI; harmless here)
+    # 1) Validate & diff
     run(["swagger-cli", "validate", args.base])
     run(["swagger-cli", "validate", args.head])
     diff_json = run(["oasdiff", "diff", "--format", "json", args.base, args.head])
@@ -171,70 +207,48 @@ def main():
         plan = llm_plan_from_diff(client, diff_json)
     with open(args.plan, "w") as f: json.dump(plan, f, indent=2)
 
-    # 3) Build collection
+    # 3) Build collection JSON (v2.1)
     pm_collection = build_postman_collection(args.collection, plan)
 
-    # 4) Official Postman MCP (remote): workspace by NAME, CRUD+export collection
+    # 4) Postman MCP: find workspace
     mcp = McpHttp(os.environ["POSTMAN_MCP_URL"], os.environ["POSTMAN_API_KEY"])
-
-    workspaces = mcp.call_tool("getWorkspaces", {})
-    if workspaces is None:
-        raise SystemExit("MCP getWorkspaces returned no content. "
-                         "Check POSTMAN_MCP_URL, API key scope, and network access.")
-
-    # Normalize to a list of workspaces; Postman MCP may return:
-    #  - {"items":[{...},{...}]}
-    #  - {"workspaces":[{...},{...}]}
-    #  - [{...}, {...}]
-    items: List[Dict[str, Any]] = []
-    if isinstance(workspaces, dict):
-        if isinstance(workspaces.get("items"), list):
-            items = workspaces["items"]
-        elif isinstance(workspaces.get("workspaces"), list):
-            items = workspaces["workspaces"]
-        elif isinstance(workspaces.get("content"), list):
-            # Defensive: handle unwrapped message envelope
-            texts = [c.get("text","") for c in workspaces["content"] if isinstance(c, dict)]
-            joined = "\n".join(texts)
-            try:
-                parsed = json.loads(joined)
-                if isinstance(parsed, dict):
-                    if isinstance(parsed.get("items"), list):
-                        items = parsed["items"]
-                    elif isinstance(parsed.get("workspaces"), list):
-                        items = parsed["workspaces"]
-            except Exception:
-                pass
-        else:
-            # Maybe it's a single workspace object
-            if workspaces.get("id") and workspaces.get("name"):
-                items = [workspaces]
-    elif isinstance(workspaces, list):
-        items = [w for w in workspaces if isinstance(w, dict)]
-
+    workspaces_obj = mcp.call_tool("getWorkspaces", {})
+    if workspaces_obj is None:
+        raise SystemExit("MCP getWorkspaces returned no content. Check POSTMAN_MCP_URL, API key, and network.")
+    items = _normalize_workspace_list(workspaces_obj)
     if not items:
-        raise SystemExit(f"Unexpected getWorkspaces shape: {type(workspaces)} {str(workspaces)[:300]}")
-
+        raise SystemExit(f"Unexpected getWorkspaces shape: {type(workspaces_obj)} {str(workspaces_obj)[:300]}")
     ws_name = os.environ.get("POSTMAN_WORKSPACE_NAME","Security Demo")
     ws = next((w for w in items if w.get("name")==ws_name), None)
     if not ws:
         names = [w.get("name") for w in items if isinstance(w, dict)]
         raise SystemExit(f"Workspace not found by name: {ws_name} (found: {names})")
-
     workspace_id = ws["id"]
 
-    # Delete existing collection (override) & create new
+    # 5) Ensure idempotency: delete any existing collection with same name
     existing = mcp.call_tool("searchCollections", {"workspaceId": workspace_id, "query": args.collection})
-    if isinstance(existing, dict) and existing.get("items"):
-        mcp.call_tool("deleteCollection", {"id": existing["items"][0]["id"]})
+    if isinstance(existing, dict) and isinstance(existing.get("items"), list) and existing["items"]:
+        try:
+            mcp.call_tool("deleteCollection", {"id": existing["items"][0]["id"]})
+        except Exception as e:
+            sys.stderr.write(f"[WARN] deleteCollection failed (continuing): {e}\n")
 
-    created = mcp.call_tool("createCollection", {"workspaceId": workspace_id, "name": args.collection})
-    if not (isinstance(created, dict) and "collection" in created and "id" in created["collection"]):
-        raise SystemExit(f"Unexpected createCollection response: {type(created)} {str(created)[:200]}")
-    cid = created["collection"]["id"]
+    # 6) ✅ Create collection by passing the FULL collection object (not just name)
+    created = mcp.call_tool("createCollection", {
+        "workspaceId": workspace_id,
+        "collection": pm_collection
+    })
+    cid = _extract_collection_id_from_create(created)
 
-    mcp.call_tool("updateCollection", {"id": cid, "collection": pm_collection})
+    # Fallback: if we didn't get an id back, search by name
+    if not cid:
+        post_create_search = mcp.call_tool("searchCollections", {"workspaceId": workspace_id, "query": args.collection})
+        if isinstance(post_create_search, dict) and isinstance(post_create_search.get("items"), list) and post_create_search["items"]:
+            cid = post_create_search["items"][0].get("id")
+    if not cid:
+        raise SystemExit(f"Could not resolve created collection id. Response: {str(created)[:300]}")
 
+    # 7) Export collection
     exported = mcp.call_tool("exportCollection", {"id": cid, "format": "v2.1"})
     if not (isinstance(exported, dict) and "collection" in exported):
         raise SystemExit(f"Unexpected exportCollection response: {type(exported)} {str(exported)[:200]}")
