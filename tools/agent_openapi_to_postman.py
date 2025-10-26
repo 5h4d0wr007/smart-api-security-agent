@@ -92,8 +92,20 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
 
 # ----------------- Postman collection builder -----------------
 def build_postman_collection(collection_name: str, plan: List[Dict[str,Any]]) -> Dict[str,Any]:
+    import re
+
+    def normalize_endpoint(ep: str) -> str:
+        ep = ep or "/"
+        if not ep.startswith("/"):
+            ep = "/" + ep
+        # Turn /pets/{id}/transfer -> /pets/{{id}}/transfer
+        ep = re.sub(r"\{([^}/]+)\}", r"{{\1}}", ep)
+        return ep
+
     def pm_item(endpoint: str, method: str, tests: List[str]) -> Dict[str,Any]:
-        url = {"raw": "{{baseUrl}}"+endpoint, "host": ["{{baseUrl}}"], "path": endpoint.lstrip("/").split("/")}
+        endpoint = normalize_endpoint(endpoint)
+        path_parts = endpoint.lstrip("/").split("/") if endpoint != "/" else []
+        url = {"raw": "{{baseUrl}}" + endpoint, "host": ["{{baseUrl}}"], "path": path_parts}
         headers = [
             {"key":"Authorization","value":"Bearer {{token}}","type":"text"},
             {"key":"Content-Type","value":"application/json","type":"text"},
@@ -135,16 +147,13 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str,Any]]) ->
         "item": items,
         "variable": [
             {"key":"baseUrl","value":"http://127.0.0.1:8000"},
-            {"key":"token","value":"demo-token"}
+            {"key":"token","value":"demo-token"},
+            {"key":"id","value":"1"}  # default for path param {{id}}
         ]
     }
 
-# ----------------- MCP helpers (v2 camelCase tools, with careful params) -----------------
+# ---------- MCP helpers ----------
 def call_tool_with_aliases(mcp: McpHttp, names: List[str], args: Dict[str, Any]) -> Any:
-    """
-    Try tools in order; treat 'Tool ... not found' / -32601 as miss and continue.
-    Bubble up -32602 (invalid args) so we can fix param shapes.
-    """
     last_err = None
     for name in names:
         try:
@@ -199,7 +208,6 @@ def collection_id_from_create(resp: Any) -> Optional[str]:
     return None
 
 def find_collection_id(mcp: McpHttp, workspace_id: str, name: str) -> Optional[str]:
-    # Prefer searchCollections; expects 'workspace' (string) + 'query'
     try:
         res = call_tool_with_aliases(mcp, ["searchCollections"], {"workspace": workspace_id, "query": name})
         if isinstance(res, dict) and isinstance(res.get("items"), list):
@@ -208,7 +216,6 @@ def find_collection_id(mcp: McpHttp, workspace_id: str, name: str) -> Optional[s
                     return it.get("id")
     except Exception:
         pass
-    # listCollections as a fallback
     try:
         res = call_tool_with_aliases(mcp, ["listCollections"], {"workspace": workspace_id})
         lst = []
@@ -284,7 +291,7 @@ def main():
     if not cid:
         raise SystemExit(f"Could not resolve created collection id. Response: {str(created)[:300]}")
 
-    # 7) Fetch collection JSON (there is no exportCollection tool). Param: collectionId (string)
+    # 7) Fetch collection JSON (no exportCollection tool). Param: collectionId (string)
     got = call_tool_with_aliases(mcp, ["getCollection"], {"collectionId": cid})
 
     # Normalize shapes:
