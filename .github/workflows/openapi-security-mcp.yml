@@ -11,7 +11,7 @@ on:
 permissions:
   contents: read
   security-events: write
-  actions: read   # ← required for upload-sarif to query the workflow run
+  actions: read   # needed by upload-sarif to query workflow run
 
 env:
   POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
@@ -46,7 +46,7 @@ jobs:
 
       - name: Install CLI tooling (Postman CLI + swagger-cli)
         run: |
-          # Postman CLI (official installer)
+          # Postman CLI (official)
           curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
           # OpenAPI validator
           npm i -g @apidevtools/swagger-cli@4
@@ -73,7 +73,7 @@ jobs:
         run: |
           python app/app.py &
           echo $! > app.pid
-          # Warm up; /pets may 401 without token; just need the server responding
+          # Warm up; just need the server responding
           for i in {1..20}; do
             if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
               echo "App is up"
@@ -113,12 +113,19 @@ jobs:
             --collection "security test collection" \
             --plan plan.json
 
-      - name: Run generated collection with Postman CLI (JSON reporter)
+      - name: Postman CLI login (non-interactive)
+        env:
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
-          # Uses defaults baked in the collection: baseUrl=http://127.0.0.1:8000, token=demo-token
+          postman login --with-api-key "$POSTMAN_API_KEY"
+
+      - name: Run generated collection with Postman CLI (JSON reporter)
+        continue-on-error: true
+        run: |
           postman collection run ./generated-security-test.postman_collection.json \
             --reporters cli,json \
-            --reporter-json-export run.json
+            --reporter-json-export run.json \
+            --no-telemetry
 
       - name: Convert Postman report → SARIF
         run: |
