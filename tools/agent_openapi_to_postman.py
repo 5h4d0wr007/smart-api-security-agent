@@ -15,6 +15,7 @@ def run(cmd: list[str]) -> str:
 def looks_empty_diff(diff_text: str) -> bool:
     try:
         d = json.loads(diff_text or "{}")
+        # empty or all keys empty
         return d == {} or all(not d.get(k) for k in d.keys())
     except Exception:
         return False
@@ -47,12 +48,12 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
         "Return ONLY JSON."
     )
 
-    # Prefer JSON mode (requires newer OpenAI APIs)
     tries = 0
     last_err = None
     while tries < 3:
         tries += 1
         try:
+            # Prefer JSON mode; model may return an object wrapper (normalize below)
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 temperature=0.1,
@@ -61,7 +62,6 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
                 response_format={"type": "json_object"},
             )
             content = resp.choices[0].message.content or ""
-            # JSON mode returns an object; we expect array; accept either and normalize
             data = parse_json_strict(content)
             if isinstance(data, dict) and "items" in data:
                 data = data["items"]
@@ -76,7 +76,7 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
             return data
         except Exception as e:
             last_err = e
-            # Fallback: try without json mode and extract from fences
+            # Fallback: no JSON mode, extract from fences
             try:
                 resp = client.chat.completions.create(
                     model="gpt-4o-mini",
@@ -92,7 +92,6 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
             except Exception as e2:
                 last_err = e2
                 time.sleep(1.0)
-    # Final fallback
     sys.stderr.write(f"[WARN] LLM JSON parsing failed after retries: {last_err}\n")
     return []
 
@@ -136,7 +135,7 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str,Any]]) ->
         method = (r.get("method") or "GET").upper()
         items.append(pm_item(endpoint, method, r.get("tests") or []))
 
-    # If plan is empty, include a tiny health-check to make runs/noise obvious
+    # If plan is empty, include a tiny health-check so the run still produces output
     if not items:
         items.append(pm_item("/", "GET", ["OK -> 200"]))
 
@@ -158,7 +157,7 @@ def main():
     ap.add_argument("--plan", default="plan.json")
     args = ap.parse_args()
 
-    # 1) Validate & diff (already done in CI step too, but harmless here)
+    # 1) Validate & diff (also done in CI; harmless here)
     run(["swagger-cli", "validate", args.base])
     run(["swagger-cli", "validate", args.head])
     diff_json = run(["oasdiff", "diff", "--format", "json", args.base, args.head])
@@ -167,7 +166,7 @@ def main():
     # 2) LLM → plan (robust)
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     if looks_empty_diff(diff_json):
-        plan = []
+        plan: List[Dict[str, Any]] = []
     else:
         plan = llm_plan_from_diff(client, diff_json)
     with open(args.plan, "w") as f: json.dump(plan, f, indent=2)
@@ -178,19 +177,43 @@ def main():
     # 4) Official Postman MCP (remote): workspace by NAME, CRUD+export collection
     mcp = McpHttp(os.environ["POSTMAN_MCP_URL"], os.environ["POSTMAN_API_KEY"])
 
-    workspaces = mcp.call_tool("getWorkspaces", {})
+    workspaces = mcp.call_tool("getWorkspaces", {})  # may be dict, list, or None depending on transport
+    if workspaces is None:
+        raise SystemExit("MCP getWorkspaces returned no content. "
+                         "Check POSTMAN_MCP_URL, API key scope, and network access.")
+
+    # Normalize to a list of workspaces; Postman MCP typically returns {"items":[...]}
+    items: List[Dict[str, Any]] = []
+    if isinstance(workspaces, dict) and "items" in workspaces and isinstance(workspaces["items"], list):
+        items = workspaces["items"]
+    elif isinstance(workspaces, list):
+        items = workspaces
+    else:
+        raise SystemExit(f"Unexpected getWorkspaces shape: {type(workspaces)} {str(workspaces)[:200]}")
+
     ws_name = os.environ.get("POSTMAN_WORKSPACE_NAME","Security Demo")
-    ws = next((w for w in workspaces.get("items",[]) if w.get("name")==ws_name), None)
-    if not ws: raise SystemExit(f"Workspace not found: {ws_name}")
+    ws = next((w for w in items if (isinstance(w, dict) and w.get("name")==ws_name)), None)
+    if not ws:
+        names = [w.get("name") for w in items if isinstance(w, dict)]
+        raise SystemExit(f"Workspace not found by name: {ws_name} (found: {names})")
+
     workspace_id = ws["id"]
 
+    # Delete existing collection (override) & create new
     existing = mcp.call_tool("searchCollections", {"workspaceId": workspace_id, "query": args.collection})
-    if existing.get("items"):
+    if isinstance(existing, dict) and existing.get("items"):
         mcp.call_tool("deleteCollection", {"id": existing["items"][0]["id"]})
     created = mcp.call_tool("createCollection", {"workspaceId": workspace_id, "name": args.collection})
-    mcp.call_tool("updateCollection", {"id": created["collection"]["id"], "collection": pm_collection})
+    if not (isinstance(created, dict) and "collection" in created and "id" in created["collection"]):
+        raise SystemExit(f"Unexpected createCollection response: {type(created)} {str(created)[:200]}")
+    cid = created["collection"]["id"]
 
-    exported = mcp.call_tool("exportCollection", {"id": created["collection"]["id"], "format": "v2.1"})
+    mcp.call_tool("updateCollection", {"id": cid, "collection": pm_collection})
+
+    exported = mcp.call_tool("exportCollection", {"id": cid, "format": "v2.1"})
+    if not (isinstance(exported, dict) and "collection" in exported):
+        raise SystemExit(f"Unexpected exportCollection response: {type(exported)} {str(exported)[:200]}")
+
     with open("generated-security-test.postman_collection.json","w") as f:
         json.dump(exported["collection"], f, indent=2)
 
