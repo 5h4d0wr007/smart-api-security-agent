@@ -1,19 +1,81 @@
 openapi: 3.0.3
-info:
-  title: Mock Security API
-  version: 1.0.0
-servers:
-  - url: http://127.0.0.1:8000
+info: { title: Pets Demo API, version: 1.1.0 }
+servers: [{ url: https://api.example.com }]
 paths:
-  /users/{userId}/profile:
+  /pets:
     get:
-      summary: Get user profile
+      summary: List pets
+      security: [ { bearerAuth: [] } ]
+      responses: { '200': { description: OK } }
+    post:
+      summary: Create pet
+      security: [ { bearerAuth: [] } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PetCreate'
+      responses: { '201': { description: Created } }
+  /pets/{id}:
+    get:
+      summary: Get pet
+      security: [ { bearerAuth: [] } ]
       parameters:
-        - name: userId
+        - name: id
           in: path
           required: true
-          schema: { type: string }
+          schema: { type: string, pattern: '^[a-f0-9-]{36}$' }   # <-- stricter: UUID
       responses:
         '200': { description: OK }
-        '401': { description: Unauthenticated }
-        '404': { description: Not Found }
+        '404': { description: Not found }
+    patch:
+      summary: Update pet
+      security: [ { bearerAuth: [] } ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-f0-9-]{36}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PetUpdate' }
+      responses: { '200': { description: OK } }
+  /pets/{id}/transfer:
+    post:
+      summary: Transfer pet ownership
+      security: [ { bearerAuth: [] } ]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-f0-9-]{36}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toUserId, transferId]
+              properties:
+                toUserId: { type: string }
+                transferId: { type: string, description: Unique request ID for idempotency }
+      responses:
+        '202': { description: Accepted }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+  schemas:
+    PetCreate:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string, minLength: 1 }   # <-- stricter
+        type: { type: string, enum: [dog, cat, bird] }
+    PetUpdate:
+      type: object
+      properties:
+        name: { type: string, minLength: 1 }   # <-- stricter
+        type: { type: string, enum: [dog, cat, bird] }
