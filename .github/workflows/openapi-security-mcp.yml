@@ -129,7 +129,7 @@ jobs:
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
-          
+
       # Upload SARIF to GitHub Code Scanning
       - name: Upload SARIF to GitHub Code Scanning
         if: ${{ steps.gates.outputs.has_secrets == 'true' && (!github.event.pull_request.head.repo.fork) }}
@@ -145,6 +145,25 @@ jobs:
           commit_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           ref:        ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || format('refs/heads/{0}', github.ref_name) }}
 
+      - name: Comment SARIF summary on PR
+        if: github.event_name == 'pull_request'
+        run: |
+          python - <<'PY'
+      import json, pathlib
+      d=json.load(open('sarif.json'))
+      res=d.get('runs',[{}])[0].get('results',[])
+      lines=["**Postman Security Test Agent Findings**"]
+      if not res: lines.append("- ✅ No security test failures detected")
+      else:
+        for r in res[:50]:
+          lines.append(f"- ❗ {r['message']['text']}")
+      pathlib.Path('sarif_summary.md').write_text("\n".join(lines))
+      PY
+      - uses: marocchino/sticky-pull-request-comment@v3
+        if: github.event_name == 'pull_request'
+        with:
+          header: Postman Security Summary
+          path: sarif_summary.md
 
       - name: Stop sample app
         if: always()
