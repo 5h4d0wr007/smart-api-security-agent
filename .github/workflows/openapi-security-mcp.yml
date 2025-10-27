@@ -1,3 +1,4 @@
+# .github/workflows/openapi-security-mcp.yml
 name: OpenAPI → Security tests with Postman MCP
 
 on:
@@ -11,13 +12,12 @@ on:
 permissions:
   contents: read
   security-events: write
-  actions: read   # needed by upload-sarif
+  actions: read   # needed by upload-sarif to query workflow run
 
 env:
   POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
   POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
   POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
-  POSTMAN_CLI_DISABLE_TELEMETRY: "true"
 
 jobs:
   test-on-openapi-change:
@@ -125,65 +125,19 @@ jobs:
         run: |
           postman collection run ./generated-security-test.postman_collection.json \
             --reporters cli,json \
-            --reporter-json-export run.json \
-          || true
-          # ensure run.json exists so next step never crashes
-          [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+            --reporter-json-export run.json
 
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # ---- NEW: sticky PR comment (human-readable summary) ----
-      - name: Post PR summary (sticky comment + job summary)
-        if: github.event_name == 'pull_request'
-        run: |
-          python - <<'PY'
-import json, pathlib, os
-sarif = json.load(open('sarif.json'))
-results = sarif.get('runs',[{}])[0].get('results',[])
-def sev_emoji(level): return {"error":"❌","warning":"⚠️","note":"ℹ️"}.get(level,"❔")
-lines = ["**Postman Security Test Agent — Findings**"]
-if not results:
-    lines.append("\n> ✅ No security test failures detected")
-else:
-    lines.append("\n|  | Severity | Finding |")
-    lines.append("|---|---|---|")
-    for r in results:
-        msg   = r.get("message",{}).get("text","(no message)")
-        level = r.get("level","note")
-        lines.append(f"| {sev_emoji(level)} | {level} | {msg} |")
-    lines.append("\n_Artifacts: `run.json`, `sarif.json`, and the generated collection are attached to this run._")
-pathlib.Path('sarif_summary.md').write_text("\n".join(lines))
-with open(os.environ['GITHUB_STEP_SUMMARY'],'w') as f: f.write("\n".join(lines))
-PY
-      - uses: marocchino/sticky-pull-request-comment@v3
-        if: github.event_name == 'pull_request'
-        with:
-          header: Postman Security Summary
-          path: sarif_summary.md
-
-      # ---- NEW: upload SARIF pinned to PR head (same-repo PRs / pushes) ----
+      # Upload SARIF only when the PR is from the same repository (not a fork)
       - name: Upload SARIF to GitHub Code Scanning
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
-          category: postman-security
-          commit_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          ref:        ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || format('refs/heads/{0}', github.ref_name) }}
-
-      - name: Upload artifacts (diff, plan, run, sarif, collection)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: api-security-output
-          path: |
-            diff.json
-            plan.json
-            run.json
-            sarif.json
-            generated-security-test.postman_collection.json
+          category: openapi-postman-security
 
       - name: Stop sample app
         if: always()
