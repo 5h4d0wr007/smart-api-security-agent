@@ -1,21 +1,18 @@
 name: OpenAPI → Security tests with Postman MCP
 
 on:
-  pull_request:
-    paths:
-      - "openapi/**.y*ml"
-      - "openapi/**.json"
-      - "app/**"
-      - "tools/**"
+  pull_request:        # always trigger on PRs; we'll self-gate on diff inside
+  workflow_dispatch:
 
 permissions:
   contents: read
   security-events: write
-  actions: read   # needed by upload-sarif to query workflow run
+  actions: read
 
 env:
-  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
-  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
+  # These can be set in Repo Settings → Variables (but empty is OK; won't block trigger)
+  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}
   POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
   POSTMAN_CLI_DISABLE_TELEMETRY: "true"
 
@@ -29,114 +26,148 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Detect whether any OpenAPI file changed in this PR
+      - name: Detect OpenAPI changes
+        id: detect
+        run: |
+          set -euo pipefail
+          BASE=origin/${{ github.base_ref }}
+          HEAD=origin/${{ github.head_ref }}
+          git fetch origin $BASE $HEAD --depth=1
+          CHANGED="$(git diff --name-only "$BASE...$HEAD" | grep -E '^openapi/.*\.(ya?ml|json)$' || true)"
+          if [ -z "$CHANGED" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No OpenAPI changes detected in this PR."
+          else
+            echo "changed=true"  >> $GITHUB_OUTPUT
+            printf "OpenAPI files changed:\n%s\n" "$CHANGED"
+          fi
+
       - name: Setup Python
+        if: steps.detect.outputs.changed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Setup Node (for swagger-cli)
+        if: steps.detect.outputs.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install Python deps
+        if: steps.detect.outputs.changed == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r app/requirements.txt
           pip install openai requests
 
       - name: Install CLI tooling (Postman CLI + swagger-cli)
+        if: steps.detect.outputs.changed == 'true'
         run: |
-          # Postman CLI (official)
-          curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
-          # OpenAPI validator
+          curl -fsSL "https://dl-cli.pstmn.io/install/linux64.sh" | sh
           npm i -g @apidevtools/swagger-cli@4
           postman --version
           swagger-cli --version
 
       - name: Install oasdiff (Linux binary, pinned)
+        if: steps.detect.outputs.changed == 'true'
         run: |
           set -euo pipefail
           OASDIFF_VERSION="v1.10.28"
           TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
-          URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
-          URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
-          echo "Downloading oasdiff ${OASDIFF_VERSION}…"
-          if ! curl -fL "$URL_PRIMARY" -o oasdiff.tgz; then
-            echo "Primary URL failed, trying fallback…"
-            curl -fL "$URL_FALLBACK" -o oasdiff.tgz
-          fi
+          for U in \
+            "https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}" \
+            "https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"; do
+            if curl -fL "$U" -o oasdiff.tgz; then break; fi
+          done
           tar -xzf oasdiff.tgz
           chmod +x oasdiff
           sudo mv oasdiff /usr/local/bin/oasdiff
+          oasdiff --help >/dev/null
 
       - name: Start sample app (localhost:8000)
+        if: steps.detect.outputs.changed == 'true'
         run: |
           python app/app.py &
           echo $! > app.pid
-          # Warm up; just need the server responding
           for i in {1..20}; do
             if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
-              echo "App is up"
-              break
+              echo "App is up"; break
             fi
             sleep 1
           done
 
       - name: Compute OpenAPI diff (base vs head)
+        if: steps.detect.outputs.changed == 'true'
         run: |
           set -euo pipefail
           BASE=origin/${{ github.base_ref }}
           HEAD=origin/${{ github.head_ref }}
           mkdir -p .tmp
+          # choose first changed OpenAPI file; fallback to repo defaults if needed
           FILE=$(git diff --name-only "$BASE...$HEAD" | grep -E '^openapi/.*\.(ya?ml|json)$' | head -n1 || true)
           if [ -z "${FILE:-}" ]; then
-            echo "No OpenAPI changes detected."
             echo '{}' > diff.json
           else
             git show "$BASE:$FILE" > .tmp/base.yaml || cp openapi/api.v1.yaml .tmp/base.yaml
             git show "$HEAD:$FILE" > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
             swagger-cli validate .tmp/base.yaml
-            swagger-cli validate .tmp/head.yaml
+            swagger-cli validate .tmp.head.yaml
             oasdiff diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
           fi
           echo "Wrote diff.json"
 
       - name: LLM → plan & create/overwrite collection via official Postman MCP
+        if: steps.detect.outputs.changed == 'true'
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+          # Provide safe defaults if repo vars are empty
+          POSTMAN_MCP_URL: ${{ env.POSTMAN_MCP_URL || 'https://mcp.postman.com/mcp' }}
+          POSTMAN_WORKSPACE_NAME: ${{ env.POSTMAN_WORKSPACE_NAME || 'Security Demo' }}
         run: |
+          set -euo pipefail
           python tools/agent_openapi_to_postman.py \
             --base openapi/api.v1.yaml \
             --head openapi/api.yaml \
             --diff diff.json \
             --collection "security test collection" \
             --plan plan.json
+          test -f generated-security-test.postman_collection.json
 
       - name: Postman CLI login (non-interactive)
+        if: steps.detect.outputs.changed == 'true'
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
           postman login --with-api-key "$POSTMAN_API_KEY"
 
       - name: Run generated collection with Postman CLI (JSON reporter)
+        if: steps.detect.outputs.changed == 'true'
         continue-on-error: true
         run: |
+          set -euo pipefail
           postman collection run ./generated-security-test.postman_collection.json \
             --reporters cli,json \
             --reporter-json-export run.json \
           || true
-          # ensure run.json exists so next step never crashes
+          # ensure run.json exists even if Postman bailed early
           [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+          ls -l run.json
 
       - name: Convert Postman report → SARIF
+        if: steps.detect.outputs.changed == 'true'
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
+          python - <<'PY'
+import json
+d=json.load(open('sarif.json'))
+print("SARIF results:", len(d.get("runs",[{}])[0].get("results",[])))
+PY
 
-      # --- NEW: sticky PR comment (readable summary) ---
       - name: Post PR summary (sticky comment + job summary)
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.detect.outputs.changed == 'true'
         run: |
           python - <<'PY'
 import json, pathlib, os
@@ -158,18 +189,18 @@ pathlib.Path('sarif_summary.md').write_text("\n".join(lines))
 with open(os.environ['GITHUB_STEP_SUMMARY'],'w') as f: f.write("\n".join(lines))
 PY
       - uses: marocchino/sticky-pull-request-comment@v3
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && steps.detect.outputs.changed == 'true'
         with:
           header: Postman Security Summary
           path: sarif_summary.md
 
-      # --- NEW: upload SARIF pinned to PR head (only same-repo PRs / pushes) ---
-      - name: Upload SARIF to GitHub Code Scanning
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Upload SARIF to GitHub Code Scanning (same-repo PRs / pushes)
+        if: steps.detect.outputs.changed == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
           category: postman-security
+          # pin to PR head on pull_request, else to pushed branch
           commit_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           ref:        ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || format('refs/heads/{0}', github.ref_name) }}
 
@@ -186,6 +217,6 @@ PY
             generated-security-test.postman_collection.json
 
       - name: Stop sample app
-        if: always()
+        if: steps.detect.outputs.changed == 'true' || always()
         run: |
           kill "$(cat app.pid)" 2>/dev/null || true
