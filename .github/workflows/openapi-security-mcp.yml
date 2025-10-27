@@ -7,6 +7,7 @@ on:
       - "openapi/**.json"
       - "app/**"
       - "tools/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -130,15 +131,15 @@ jobs:
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # ---- Only change from Step-0 → Step-1: pin SARIF upload to PR head ----
+      # Pin upload to PR head (use 'ref' and 'sha', not 'commit_sha')
       - name: Upload SARIF to GitHub Code Scanning
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
           category: openapi-postman-security
-          commit_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          ref:        ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || format('refs/heads/{0}', github.ref_name) }}
+          ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
+          sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Stop sample app
         if: always()
