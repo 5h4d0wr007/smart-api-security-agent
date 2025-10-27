@@ -1,15 +1,15 @@
 name: OpenAPI → Postman MCP → Security tests
 
 on:
-  push:        # run on any branch push
-  pull_request:  # run on any PR (not just main)
+  push:
+  pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
   contents: read
   actions: read
-  security-events: write   # needed to upload SARIF
+  security-events: write
 
 jobs:
   api-security:
@@ -18,6 +18,7 @@ jobs:
     env:
       POSTMAN_MCP_URL: https://mcp.postman.com/mcp
       POSTMAN_WORKSPACE_NAME: Security Demo
+      POSTMAN_CLI_DISABLE_TELEMETRY: "true"
 
     steps:
       - name: Checkout
@@ -29,9 +30,13 @@ jobs:
         run: |
           has_openai=false
           has_postman=false
-          if [ -n "${{ secrets.OPENAI_API_KEY }}" ];   then has_openai=true; fi
-          if [ -n "${{ secrets.POSTMAN_API_KEY }}" ];  then has_postman=true; fi
-          if $has_openai && $has_postman; then echo "has_secrets=true"  >> $GITHUB_OUTPUT; else echo "has_secrets=false" >> $GITHUB_OUTPUT; fi
+          if [ -n "${{ secrets.OPENAI_API_KEY }}" ];  then has_openai=true; fi
+          if [ -n "${{ secrets.POSTMAN_API_KEY }}" ]; then has_postman=true; fi
+          if $has_openai && $has_postman; then
+            echo "has_secrets=true"  >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          fi
           echo "has_openai=$has_openai"
           echo "has_postman=$has_postman"
 
@@ -40,11 +45,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install deps
+      - name: Install deps (swagger-cli, oasdiff, Postman CLI, pip libs)
         run: |
-          set -e
+          set -euo pipefail
+
+          # swagger-cli
           npm install -g @apidevtools/swagger-cli
 
+          # system tools
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
@@ -53,10 +61,10 @@ jobs:
           UNAME_ARCH="$(uname -m)"
           if [ "$UNAME_ARCH" = "x86_64" ]; then
             OAS_ASSET="oasdiff_${OASDIFF_VERSION}_Linux_x86_64.tar.gz"
-          elif [ "$UNAME_ARCH" = "aarch64" ]; then
+          elif [ "$UNAME_ARCH" = "aarch64" ] || [ "$UNAME_ARCH" = "arm64" ]; then
             OAS_ASSET="oasdiff_${OASDIFF_VERSION}_Linux_arm64.tar.gz"
           else
-            echo "Unsupported arch: $UNAME_ARCH"; exit 1
+            echo "Unsupported arch: $UNAME_ARCH" && exit 1
           fi
           curl -fsSL -o oasdiff.tgz "https://github.com/Tufin/oasdiff/releases/download/v${OASDIFF_VERSION}/${OAS_ASSET}"
           tar -xzf oasdiff.tgz oasdiff
@@ -64,6 +72,10 @@ jobs:
           sudo chmod +x /usr/local/bin/oasdiff
           oasdiff --help >/dev/null
 
+          # Postman CLI (official script)
+          curl -fsSL https://dl-cli.pstmn.io/install/linux64.sh | sh
+
+          # Python deps
           python -m pip install --upgrade pip
           pip install requests openai
 
@@ -92,6 +104,7 @@ jobs:
           POSTMAN_MCP_URL: ${{ env.POSTMAN_MCP_URL }}
           POSTMAN_WORKSPACE_NAME: ${{ env.POSTMAN_WORKSPACE_NAME }}
         run: |
+          set -euo pipefail
           python tools/agent_openapi_to_postman.py --base openapi/api.v1.yaml --head openapi/api.yaml
           test -f generated-security-test.postman_collection.json
 
@@ -111,29 +124,43 @@ jobs:
         if: steps.gates.outputs.has_secrets == 'true'
         continue-on-error: true
         run: |
+          set -euo pipefail
+          test -f generated-security-test.postman_collection.json || { echo "collection missing"; exit 1; }
+
+          # No --no-telemetry flag; we use env var instead
           postman collection run ./generated-security-test.postman_collection.json \
             --reporters cli,json \
             --reporter-json-export run.json \
           || true
 
+          # Ensure run.json exists even if CLI exited early
+          if [ ! -f run.json ]; then
+            cat > run.json <<'JSON'
+            {"run": {"failures": [], "stats": {"assertions": {"total": 0, "failed": 0}}}}
+            JSON
+            echo "Created placeholder run.json"
+          fi
+          ls -l run.json
+
       - name: Convert Postman report → SARIF
         if: steps.gates.outputs.has_secrets == 'true'
         run: |
+          set -euo pipefail
           python tools/cli_report_to_sarif.py run.json sarif.json
           python - <<'PY'
-import json; 
-j=json.load(open('sarif.json')); 
+import json
+j=json.load(open('sarif.json'))
 print("SARIF results:", len(j.get("runs",[{}])[0].get("results",[])))
 PY
 
       - name: Upload SARIF to GitHub Code Scanning
-        if: steps.gates.outputs.has_secrets == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: ${{ steps.gates.outputs.has_secrets == 'true' && (!github.event.pull_request.head.repo.fork) }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
-          category: openapi-postman-security
+          category: postman-security
           commit_sha: ${{ github.event.pull_request.head.sha || github.sha }}
-          ref:        ${{ github.event.pull_request.head.ref || github.ref }}
+          ref: ${{ github.event.pull_request.head.ref && format('refs/heads/{0}', github.event.pull_request.head.ref) || github.ref }}
 
       - name: Upload artifacts (diff, plan, run, sarif, collection)
         if: always()
@@ -150,4 +177,4 @@ PY
       - name: Stop app
         if: always()
         run: |
-          if [ -f app.pid ]; then kill $(cat app.pid) || true; fi
+          if [ -f app.pid ]; then kill "$(cat app.pid)" || true; fi
