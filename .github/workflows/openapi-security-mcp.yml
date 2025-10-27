@@ -129,14 +129,22 @@ jobs:
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
-
-      # Upload SARIF only when the PR is from the same repository (not a fork)
+          
+      # Upload SARIF to GitHub Code Scanning
       - name: Upload SARIF to GitHub Code Scanning
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        if: ${{ steps.gates.outputs.has_secrets == 'true' && (!github.event.pull_request.head.repo.fork) }}
+        env:
+          SHOW_REF: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || format('refs/heads/{0}', github.ref_name) }}
+          SHOW_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          echo "Uploading SARIF for ref=$SHOW_REF sha=$SHOW_SHA"
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
-          category: openapi-postman-security
+          category: postman-security
+          commit_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref:        ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || format('refs/heads/{0}', github.ref_name) }}
+
 
       - name: Stop sample app
         if: always()
