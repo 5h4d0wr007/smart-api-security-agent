@@ -3,9 +3,12 @@ name: OpenAPI → Security tests with Postman MCP
 on:
   pull_request:
     paths:
-      - "openapi/**/*.{yml,yaml,json}"
+      - "openapi/**/*.yml"
+      - "openapi/**/*.yaml"
+      - "openapi/**/*.json"
       - "app/**"
       - "tools/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
