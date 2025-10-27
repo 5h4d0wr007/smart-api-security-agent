@@ -2,12 +2,7 @@ name: OpenAPI → Security tests with Postman MCP
 
 on:
   pull_request:
-    paths:
-      - "openapi/**/*.yml"
-      - "openapi/**/*.yaml"
-      - "openapi/**/*.json"
-      - "app/**"
-      - "tools/**"
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -24,12 +19,48 @@ env:
 jobs:
   test-on-openapi-change:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # Detect if this PR actually changed openapi/app/tools (so we can skip gracefully)
+      - name: Determine if relevant files changed
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.base_ref }}"
+          HEAD="${{ github.head_ref }}"
+          # When running on pull_request, both are set. Fallbacks for safety:
+          if [ -z "${BASE}" ]; then BASE="$(git rev-parse origin/${{ github.event.pull_request.base.ref || 'main' }})"; fi
+          if [ -z "${HEAD}" ]; then HEAD="$(git rev-parse HEAD)"; fi
+
+          echo "Base: $BASE"
+          echo "Head: $HEAD"
+
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}" || true
+          git fetch --no-tags --depth=1 origin "${{ github.head_ref }}" || true
+
+          MAPFILE -t CHANGED < <( git diff --name-only "origin/${{ github.base_ref }}"..."origin/${{ github.head_ref }}" || true )
+
+          echo "Changed files:"
+          printf ' - %s\n' "${CHANGED[@]:-<none>}"
+
+          should_run=false
+          for f in "${CHANGED[@]}"; do
+            if [[ "$f" =~ ^openapi/.*\.(ya?ml|json)$ || "$f" =~ ^app/.* || "$f" =~ ^tools/.* ]]; then
+              should_run=true
+              break
+            fi
+          done
+
+          echo "should_run=$should_run"
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+
+      # Gate secrets (handles forked PRs safely)
       - name: Discover secrets availability (gate for forks)
         id: gates
         shell: bash
@@ -46,23 +77,34 @@ jobs:
           echo "has_openai=$has_openai"
           echo "has_postman=$has_postman"
 
+      - name: Short-circuit (no relevant changes)
+        if: steps.changes.outputs.should_run != 'true'
+        run: |
+          echo "::notice::No changes in openapi/, app/, or tools/ — skipping security test pipeline."
+
+      # ----------------- actual pipeline (guarded by should_run) -----------------
+
       - name: Setup Python
+        if: steps.changes.outputs.should_run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Setup Node (for swagger-cli)
+        if: steps.changes.outputs.should_run == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Install Python deps
+        if: steps.changes.outputs.should_run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r app/requirements.txt
           pip install openai requests
 
       - name: Install CLI tooling (Postman CLI + swagger-cli)
+        if: steps.changes.outputs.should_run == 'true'
         run: |
           curl -fsSL "https://dl-cli.pstmn.io/install/linux64.sh" | sh
           npm i -g @apidevtools/swagger-cli@4
@@ -70,6 +112,7 @@ jobs:
           swagger-cli --version
 
       - name: Install oasdiff (Linux binary, pinned)
+        if: steps.changes.outputs.should_run == 'true'
         run: |
           set -euo pipefail
           OASDIFF_VERSION="v1.10.28"
@@ -85,6 +128,7 @@ jobs:
           oasdiff --help >/dev/null
 
       - name: Start sample app (localhost:8000)
+        if: steps.changes.outputs.should_run == 'true'
         run: |
           python app/app.py &
           echo $! > app.pid
@@ -96,6 +140,7 @@ jobs:
           done
 
       - name: Compute OpenAPI diff (base vs head)
+        if: steps.changes.outputs.should_run == 'true'
         run: |
           set -euo pipefail
           BASE=origin/${{ github.base_ref }}
@@ -109,12 +154,12 @@ jobs:
             git show "$HEAD:$FILE" > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
             swagger-cli validate .tmp/base.yaml
             swagger-cli validate .tmp/head.yaml
-            oasdiff diff --format json .tmp/base.yaml .tmp.head.yaml > diff.json
+            oasdiff diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
           fi
           echo "Wrote diff.json"
 
       - name: LLM → plan & create/overwrite collection via official Postman MCP
-        if: steps.gates.outputs.has_secrets == 'true'
+        if: steps.changes.outputs.should_run == 'true' && steps.gates.outputs.has_secrets == 'true'
         env:
           OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
@@ -128,14 +173,14 @@ jobs:
           test -f generated-security-test.postman_collection.json
 
       - name: Postman CLI login (non-interactive)
-        if: steps.gates.outputs.has_secrets == 'true'
+        if: steps.changes.outputs.should_run == 'true' && steps.gates.outputs.has_secrets == 'true'
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
           postman login --with-api-key "$POSTMAN_API_KEY"
 
       - name: Run generated collection with Postman CLI (JSON reporter)
-        if: steps.gates.outputs.has_secrets == 'true'
+        if: steps.changes.outputs.should_run == 'true' && steps.gates.outputs.has_secrets == 'true'
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -149,7 +194,7 @@ jobs:
           ls -l run.json
 
       - name: Convert Postman report → SARIF
-        if: steps.gates.outputs.has_secrets == 'true'
+        if: steps.changes.outputs.should_run == 'true' && steps.gates.outputs.has_secrets == 'true'
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
           python - <<'PY'
@@ -159,13 +204,13 @@ print("SARIF results:", len(d.get("runs",[{}])[0].get("results",[])))
 PY
 
       - name: Announce SARIF target
-        if: ${{ steps.gates.outputs.has_secrets == 'true' && (!github.event.pull_request.head.repo.fork) }}
+        if: steps.changes.outputs.should_run == 'true' && steps.gates.outputs.has_secrets == 'true' && (!github.event.pull_request.head.repo.fork)
         run: |
           echo "ref = ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || format('refs/heads/{0}', github.ref_name) }}"
           echo "sha = ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"
 
       - name: Upload SARIF to GitHub Code Scanning
-        if: ${{ steps.gates.outputs.has_secrets == 'true' && (!github.event.pull_request.head.repo.fork) }}
+        if: steps.changes.outputs.should_run == 'true' && steps.gates.outputs.has_secrets == 'true' && (!github.event.pull_request.head.repo.fork)
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
@@ -174,7 +219,7 @@ PY
           ref:        ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || format('refs/heads/{0}', github.ref_name) }}
 
       - name: Post PR summary (sticky comment + job summary)
-        if: github.event_name == 'pull_request'
+        if: steps.changes.outputs.should_run == 'true' && github.event_name == 'pull_request'
         run: |
           python - <<'PY'
 import json, pathlib, os
@@ -196,7 +241,7 @@ pathlib.Path('sarif_summary.md').write_text("\n".join(lines))
 with open(os.environ['GITHUB_STEP_SUMMARY'],'w') as f: f.write("\n".join(lines))
 PY
       - uses: marocchino/sticky-pull-request-comment@v3
-        if: github.event_name == 'pull_request'
+        if: steps.changes.outputs.should_run == 'true' && github.event_name == 'pull_request'
         with:
           header: Postman Security Summary
           path: sarif_summary.md
@@ -214,6 +259,6 @@ PY
             generated-security-test.postman_collection.json
 
       - name: Stop sample app
-        if: always()
+        if: steps.changes.outputs.should_run == 'true'
         run: |
           kill "$(cat app.pid)" 2>/dev/null || true
