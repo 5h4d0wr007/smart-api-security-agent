@@ -24,14 +24,12 @@ env:
 jobs:
   test-on-openapi-change:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Gate secrets (handles forked PRs safely)
       - name: Discover secrets availability (gate for forks)
         id: gates
         shell: bash
@@ -111,7 +109,7 @@ jobs:
             git show "$HEAD:$FILE" > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
             swagger-cli validate .tmp/base.yaml
             swagger-cli validate .tmp/head.yaml
-            oasdiff diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
+            oasdiff diff --format json .tmp/base.yaml .tmp.head.yaml > diff.json
           fi
           echo "Wrote diff.json"
 
@@ -145,13 +143,11 @@ jobs:
             --reporters cli,json \
             --reporter-json-export run.json \
           || true
-          # ensure run.json exists even if Postman bailed early
           if [ ! -f run.json ]; then
             echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
           fi
           ls -l run.json
 
-      # ---------- FROM HERE: upload + PR visibility ----------
       - name: Convert Postman report → SARIF
         if: steps.gates.outputs.has_secrets == 'true'
         run: |
