@@ -12,7 +12,7 @@ on:
 permissions:
   contents: read
   security-events: write
-  actions: read   # needed by upload-sarif to query workflow run
+  actions: read   # needed by upload-sarif
 
 env:
   POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
@@ -134,7 +134,7 @@ jobs:
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # === NEW: Sticky PR comment and Job Summary ===
+      # === Sticky PR comment + Job Summary (readable findings) ===
       - name: Post PR summary (sticky comment + job summary)
         if: github.event_name == 'pull_request'
         run: |
@@ -163,7 +163,7 @@ PY
           header: Postman Security Summary
           path: sarif_summary.md
 
-      # Pin upload to PR head (use 'ref' and 'sha')
+      # Upload SARIF pinned to PR head (only same-repo PRs / pushes)
       - name: Upload SARIF to GitHub Code Scanning
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
@@ -173,7 +173,7 @@ PY
           ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
           sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
-      # (Optional but helpful) keep artifacts for download/debug
+      # Keep artifacts for download/debug
       - name: Upload artifacts (diff, plan, run, sarif, collection)
         if: always()
         uses: actions/upload-artifact@v4
