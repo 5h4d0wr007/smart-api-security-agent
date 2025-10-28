@@ -2,20 +2,21 @@ name: OpenAPI → Security tests with Postman MCP
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
-  workflow_dispatch:
+    paths:
+      - "openapi/**.y*ml"
+      - "openapi/**.json"
+      - "app/**"
+      - "tools/**"
 
 permissions:
   contents: read
   security-events: write
-  actions: read
-  pull-requests: write
+  actions: read   # needed by upload-sarif to query workflow run
 
 env:
-  POSTMAN_MCP_URL: https://mcp.postman.com/mcp
-  POSTMAN_WORKSPACE_NAME: Smart API Security Agent
-  POSTMAN_ENV_NAME: SASA Env
-  POSTMAN_CLI_DISABLE_TELEMETRY: "true"
+  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
+  POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
 
 jobs:
   test-on-openapi-change:
@@ -45,7 +46,9 @@ jobs:
 
       - name: Install CLI tooling (Postman CLI + swagger-cli)
         run: |
+          # Postman CLI (official)
           curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
+          # OpenAPI validator
           npm i -g @apidevtools/swagger-cli@4
           postman --version
           swagger-cli --version
@@ -55,11 +58,13 @@ jobs:
           set -euo pipefail
           OASDIFF_VERSION="v1.10.28"
           TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
-          for U in \
-            "https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}" \
-            "https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"; do
-            if curl -fL "$U" -o oasdiff.tgz; then break; fi
-          done
+          URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          echo "Downloading oasdiff ${OASDIFF_VERSION}…"
+          if ! curl -fL "$URL_PRIMARY" -o oasdiff.tgz; then
+            echo "Primary URL failed, trying fallback…"
+            curl -fL "$URL_FALLBACK" -o oasdiff.tgz
+          fi
           tar -xzf oasdiff.tgz
           chmod +x oasdiff
           sudo mv oasdiff /usr/local/bin/oasdiff
@@ -68,9 +73,11 @@ jobs:
         run: |
           python app/app.py &
           echo $! > app.pid
+          # Warm up; just need the server responding
           for i in {1..20}; do
             if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
-              echo "App is up"; break
+              echo "App is up"
+              break
             fi
             sleep 1
           done
@@ -94,9 +101,9 @@ jobs:
           fi
           echo "Wrote diff.json"
 
-      - name: LLM → plan & create/overwrite collection via Postman MCP
+      - name: LLM → plan & create/overwrite collection via official Postman MCP
         env:
-          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
           python tools/agent_openapi_to_postman.py \
@@ -105,29 +112,29 @@ jobs:
             --diff diff.json \
             --collection "security test collection" \
             --plan plan.json
-          test -f generated-security-test.postman_collection.json
 
-      - name: Normalize path placeholders for Postman
+      # ---------- minimal additions start ----------
+      - name: Normalize placeholders {id} → {{id}} in generated collection
         run: |
           python - <<'PY'
-import json, re
+import json, re, sys
 p='generated-security-test.postman_collection.json'
 j=json.load(open(p))
 def walk(x):
-    if isinstance(x, dict):
-        if x.get('request') and isinstance(x['request'].get('url'), dict):
-            raw = x['request']['url'].get('raw')
-            if isinstance(raw, str):
-                x['request']['url']['raw'] = re.sub(r'\{([A-Za-z0-9_]+)\}', r'{{\\1}}', raw)
-        for v in x.values(): walk(v)
-    elif isinstance(x, list):
-        for v in x: walk(v)
+  if isinstance(x, dict):
+    if x.get('request') and isinstance(x['request'].get('url'), dict):
+      raw = x['request']['url'].get('raw')
+      if isinstance(raw, str):
+        x['request']['url']['raw'] = re.sub(r'\{([A-Za-z0-9_]+)\}', r'{{\\1}}', raw)
+    for v in x.values(): walk(v)
+  elif isinstance(x, list):
+    for v in x: walk(v)
 walk(j)
 open(p,'w').write(json.dumps(j,indent=2))
-print("Placeholders normalized.")
+print("Placeholders normalized → mustache.")
 PY
 
-      - name: Build Postman environment (env.json)
+      - name: Build Postman environment (env.json) for dynamic IDs/tokens
         run: |
           python - <<'PY'
 import json, pathlib
@@ -147,18 +154,19 @@ env = {
     {"key":"accountIdOther","value":"102","type":"text","enabled":True}
   ]
 }
+# allow the agent plan to override any defaults
 try:
   plan = json.load(open('plan.json'))
-  for e in env["values"]:
-    k=e["key"]
-    v=plan.get("environment",{}).get(k)
-    if v is not None: e["value"]=str(v)
+  for v in env["values"]:
+    k=v["key"]; new = plan.get("environment",{}).get(k)
+    if new is not None: v["value"]=str(new)
 except FileNotFoundError:
   pass
 pathlib.Path('env.json').write_text(json.dumps(env,indent=2))
-print("env.json written")
+print("env.json written with default demo values")
 PY
           cat env.json
+      # ---------- minimal additions end ----------
 
       - name: Postman CLI login (non-interactive)
         env:
@@ -172,76 +180,19 @@ PY
           postman collection run ./generated-security-test.postman_collection.json \
             --environment ./env.json \
             --reporters cli,json \
-            --reporter-json-export run.json \
-          || true
-          [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+            --reporter-json-export run.json
 
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      - name: Build PR summary markdown
-        if: github.event_name == 'pull_request'
-        run: |
-          cat <<'NODE' > build_summary.js
-          const fs = require('fs');
-          const s = JSON.parse(fs.readFileSync('sarif.json','utf8'));
-          const res = ((s.runs||[{}])[0].results)||[];
-          const total = res.length;
-          const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
-          const lines=[];
-          lines.push('**Postman Security Test Agent — Findings**');
-          lines.push('');
-          lines.push(`Detected **${total}** finding${total===1?'':'s'}.`);
-          if(total===0){
-            lines.push('');
-            lines.push('> ✅ No security test failures detected');
-          }else{
-            lines.push('');
-            lines.push('|  | Severity | Finding |');
-            lines.push('|---|---|---|');
-            for(const r of res){
-              const lvl=r.level||'note';
-              const msg=(r.message&&r.message.text)||'(no message)';
-              lines.push(`| ${emoji(lvl)} | ${lvl} | ${msg} |`);
-            }
-          }
-          lines.push('');
-          lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
-          fs.writeFileSync('sarif_summary.md', lines.join('\n'));
-          NODE
-          node build_summary.js
-          cat sarif_summary.md
-
-      - name: Post sticky PR comment
-        if: github.event_name == 'pull_request'
-        uses: marocchino/sticky-pull-request-comment@v2
-        with:
-          header: Postman Security Summary
-          path: sarif_summary.md
-
+      # Upload SARIF only when the PR is from the same repository (not a fork)
       - name: Upload SARIF to GitHub Code Scanning
-        if: github.event_name == 'pull_request'
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
           category: openapi-postman-security
-          ref: refs/heads/${{ github.head_ref }}
-          sha: ${{ github.event.pull_request.head.sha }}
-          wait-for-processing: true
-
-      - name: Upload artifacts (diff, plan, run, sarif, collection, env)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: api-security-output
-          path: |
-            diff.json
-            plan.json
-            run.json
-            sarif.json
-            env.json
-            generated-security-test.postman_collection.json
 
       - name: Stop sample app
         if: always()
