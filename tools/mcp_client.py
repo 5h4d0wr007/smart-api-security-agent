@@ -15,6 +15,7 @@ class PostmanMCP:
       - Tries with and without trailing slash.
       - Tries header permutations (Bearer only, X-API-Key only, both).
       - Sets Accept to *application/json, text/event-stream* (required by server).
+      - Detects and parses SSE (text/event-stream) responses.
       - Surfaces useful response body excerpts on errors.
 
     Env:
@@ -29,7 +30,6 @@ class PostmanMCP:
         if not self.api_key:
             raise RuntimeError("POSTMAN_API_KEY is required for Postman MCP calls.")
 
-        # Build the small set of URL candidates (US only), with/without trailing slash
         env_url = (base_url or os.getenv("POSTMAN_MCP_URL") or self.US_DEFAULT).strip().rstrip("/")
         urls: List[str] = []
         for u in (env_url, self.US_DEFAULT):
@@ -39,7 +39,6 @@ class PostmanMCP:
             if f"{u}/" not in urls:
                 urls.append(f"{u}/")
         self.urls = urls
-
         self.timeout = timeout
 
     # ---------- internal permutations ----------
@@ -47,7 +46,6 @@ class PostmanMCP:
     def _header_permutations(self) -> List[Dict[str, str]]:
         """
         The server requires clients to accept BOTH application/json and text/event-stream.
-        We always include that combination (with a wildcard variant too).
         """
         common = {"User-Agent": "smart-api-security-agent/1.0"}
         accept_required = "application/json, text/event-stream"
@@ -94,6 +92,41 @@ class PostmanMCP:
             },
         ]
 
+    # ---------- SSE helpers ----------
+
+    @staticmethod
+    def _parse_sse_to_json(text: str) -> Dict[str, Any]:
+        """
+        Parse Server-Sent Events payload (as a single accumulated string) into JSON.
+        We concatenate all 'data: ' lines, then json.loads the join.
+        """
+        if not text:
+            raise RuntimeError("Empty SSE response.")
+
+        # Keep only 'data:' lines and strip the prefix
+        datas: List[str] = []
+        for line in text.splitlines():
+            line = line.strip("\r\n")
+            if line.startswith("data:"):
+                datas.append(line[len("data:"):].strip())
+
+        if not datas:
+            # Heuristic: some gateways include leading "event:" then a single 'data: {...}'
+            # If we didn't capture any, try to find the first '{'..'}' block.
+            s = text
+            try:
+                start = s.find("{")
+                end = s.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    return json.loads(s[start:end + 1])
+            except Exception:
+                pass
+            raise RuntimeError(f"Unable to extract JSON from SSE:\n{text[:500]}")
+
+        joined = "".join(datas).strip()
+        # joined is expected to be a full JSON document
+        return json.loads(joined)
+
     # ---------- core JSON-RPC with retries ----------
 
     def _rpc(self, url: str, headers: Dict[str, str], method: str, params: Dict[str, Any]):
@@ -102,7 +135,7 @@ class PostmanMCP:
 
         r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=self.timeout)
 
-        # Negotation error is explicit from the gateway, surface details
+        # Negotiation error is explicit from the gateway
         if r.status_code == 406:
             raise requests.HTTPError(
                 f"406 Not Acceptable from {url} "
@@ -113,18 +146,25 @@ class PostmanMCP:
 
         r.raise_for_status()
 
-        try:
-            data = r.json()
-        except Exception as e:
-            raise RuntimeError(
-                f"Non-JSON response from {url} (status {r.status_code}): {r.text[:500]!r}"
-            ) from e
+        ctype = (r.headers.get("Content-Type") or "").lower()
 
-        if "error" in data and data["error"]:
+        # Some deployments stream JSON-RPC results via SSE
+        if "text/event-stream" in ctype or r.text.startswith("event:"):
+            data = self._parse_sse_to_json(r.text)
+        else:
+            try:
+                data = r.json()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Non-JSON response from {url} (status {r.status_code}): {r.text[:500]!r}"
+                ) from e
+
+        # JSON-RPC envelope check
+        if isinstance(data, dict) and "error" in data and data["error"]:
             err = data["error"]
             raise RuntimeError(f"MCP error {err.get('code')}: {err.get('message')}")
 
-        return data.get("result") or data
+        return data.get("result") if isinstance(data, dict) and "result" in data else data
 
     def _rpc_with_fallbacks(self, method: str, params: Dict[str, Any]):
         last_err: Exception | None = None
