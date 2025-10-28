@@ -1,172 +1,146 @@
+# tools/mcp_client.py
 import os
-import json
 import time
-import uuid
-from typing import Any, Dict, Optional, List
+import json
+from typing import Any, Dict, Optional
+
 import requests
 
 
-class MCPError(RuntimeError):
+class MCPClientError(RuntimeError):
     pass
 
 
 class PostmanMCPClient:
     """
-    Minimal JSON-RPC client for Postman MCP with graceful tool fallbacks.
-
-    It supports:
-      - getWorkspaces
-      - getCollections
-      - createCollection
-      - (optional) updateCollection (if available)
-      - (optional) deleteCollection (if available)
-
-    If updateCollection isn't available, it falls back to createCollection.
+    Minimal JSON-RPC client for Postman MCP (HTTP endpoint).
+    Works with JSON responses and JSON over Server-Sent Events.
     """
 
-    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None, timeout: int = 60):
-        self.base_url = (base_url or os.getenv("POSTMAN_MCP_URL") or "").rstrip("/") + "/"
-        if not self.base_url.startswith("http"):
-            raise ValueError("POSTMAN_MCP_URL must be set to a valid http(s) URL, e.g. https://mcp.postman.com/mcp")
-        self.api_key = api_key or os.getenv("POSTMAN_API_KEY")
-        if not self.api_key:
-            raise ValueError("POSTMAN_API_KEY must be provided (env or argument)")
+    def __init__(self,
+                 base_url: Optional[str] = None,
+                 api_key: Optional[str] = None,
+                 timeout: int = 60):
+        # Prefer repo variable, fall back to env
+        self.base_url = (base_url
+                         or os.getenv("POSTMAN_MCP_URL")
+                         or "https://mcp.postman.com/mcp").rstrip("/") + "/"
+        self.api_key = api_key or os.getenv("POSTMAN_API_KEY") or ""
         self.timeout = timeout
-        self._session = requests.Session()
-        # Accept both JSON and SSE (some MCP responses stream in text/event-stream)
+
+        # Build headers once; include all common key headers
         self._base_headers = {
-            "Authorization": f"Postman-Api-Key {self.api_key}",
-            "Accept": "application/json, text/event-stream",
             "Content-Type": "application/json; charset=utf-8",
+            # MCP uses JSON and can stream via SSE; advertise both
+            "Accept": "application/json, text/event-stream",
+            "User-Agent": "smart-api-security-agent/1.0",
         }
 
-    # ---------- low-level RPC helpers ----------
+        if not self.api_key:
+            raise MCPClientError(
+                "POSTMAN_API_KEY not set. Add it as a repository Secret named "
+                "'POSTMAN_API_KEY' and pass it to the job step env."
+            )
 
-    def _rpc(self, url: str, headers: Dict[str, str], method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Make a JSON-RPC call. Handles JSON or SSE (text/event-stream) responses."""
-        payload = {"jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": method, "params": params}
-        r = self._session.post(url, headers=headers, data=json.dumps(payload), timeout=self.timeout)
+        # Provide the API key in multiple, commonly accepted forms.
+        # The server will accept one or more of these.
+        key = self.api_key
+        self._base_headers.update({
+            "x-api-key": key,
+            "X-API-Key": key,
+            "X-Postman-API-Key": key,
+            "Authorization": f"Bearer {key}",
+        })
 
-        # Fast path: normal JSON
+    # ---------- low-level RPC ----------
+
+    def _rpc(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Perform a JSON-RPC call. Supports JSON responses and JSON chunks sent
+        via text/event-stream. Raises MCPClientError on protocol/server errors.
+        """
+        url = self.base_url
+        payload = {"jsonrpc": "2.0", "id": int(time.time() * 1000), "method": method, "params": params}
+
+        r = requests.post(url,
+                          data=json.dumps(payload),
+                          headers=self._base_headers,
+                          timeout=self.timeout)
+
+        # Some deployments send JSON in SSE frames (text/event-stream) even with 200 OK.
         ctype = r.headers.get("Content-Type", "")
         if "application/json" in ctype:
             data = r.json()
-            if "error" in data and data["error"]:
-                err = data["error"]
-                raise MCPError(f"MCP error {err.get('code')}: {err.get('message')}")
-            return data.get("result") or {}
-
-        # SSE path: parse last 'data: {...}' event chunk
-        if "text/event-stream" in ctype or r.text.startswith("event:"):
-            # collect the last 'data: ' JSON we receive
-            last_json = None
-            for line in r.text.splitlines():
-                line = line.strip()
-                if line.startswith("data: "):
-                    try:
-                        last_json = json.loads(line[len("data: "):])
-                    except Exception:
-                        # ignore malformed interim chunks
-                        pass
-            if isinstance(last_json, dict):
-                if "error" in last_json and last_json["error"]:
-                    err = last_json["error"]
-                    raise MCPError(f"MCP error {err.get('code')}: {err.get('message')}")
-                return last_json.get("result") or {}
-            raise RuntimeError(f"Non-JSON SSE body from {url}")
-
-        # Any other content type is unexpected
-        raise RuntimeError(
-            f"Unexpected response from {url} (status {r.status_code}, Content-Type={ctype}): {r.text[:200]}"
-        )
-
-    def _rpc_with_fallbacks(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Try a few URL variants because some tenants require trailing slash etc.
-        """
-        last_err = None
-        for suffix in ("", "/"):
-            url = f"{self.base_url.rstrip('/')}{suffix}"
+        elif "text/event-stream" in ctype or r.text.startswith("event:"):
+            # Extract last JSON 'data:' line we received.
+            data = self._parse_sse_json(r.text)
+        else:
+            # Try to parse JSON anyway; if it fails, raise a helpful error.
             try:
-                return self._rpc(url, dict(self._base_headers), method, params)
-            except Exception as e:
-                last_err = e
-                # brief backoff in case of transient gateway hiccups
-                time.sleep(0.2)
-        raise last_err or RuntimeError("MCP call failed after all retries")
-
-    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
-        result = self._rpc_with_fallbacks("tools/call", {"name": name, "arguments": arguments})
-        # Most MCP tool responses pack the useful bits in result.content[0].text
-        content = result.get("content", [])
-        if content and isinstance(content[0], dict) and content[0].get("type") == "text":
-            txt = content[0].get("text", "")
-            try:
-                return json.loads(txt)
+                data = r.json()
             except Exception:
-                return txt
-        return result
+                raise MCPClientError(
+                    f"Non-JSON response from {url} (status {r.status_code}): {r.text[:200]}"
+                )
 
-    # ---------- tool wrappers ----------
+        if "error" in data:
+            err = data["error"]
+            raise MCPClientError(f"MCP error {err.get('code')}: {err.get('message')}")
+
+        return data.get("result", {})
+
+    @staticmethod
+    def _parse_sse_json(text: str) -> Dict[str, Any]:
+        """
+        Very small SSE parser: looks for the last 'data: { ... }' JSON object.
+        """
+        last_json = None
+        for line in text.splitlines():
+            if line.startswith("data:"):
+                chunk = line[len("data:"):].strip()
+                if chunk:
+                    try:
+                        obj = json.loads(chunk)
+                        last_json = obj
+                    except Exception:
+                        # ignore non-JSON data lines
+                        pass
+        if last_json is None:
+            raise MCPClientError("SSE stream contained no JSON 'data:' frames")
+        # JSON-RPC result may be nested under 'result'
+        return last_json.get("result", last_json)
+
+    # ---------- high-level helpers (tool wrappers) ----------
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        return self._rpc("tools/call", {"name": name, "arguments": arguments})
 
     def get_workspaces(self) -> Dict[str, Any]:
-        return self.call_tool("getWorkspaces", {}) or {}
+        # returns: { "workspaces": [...] }
+        return self.call_tool("getWorkspaces", {})
 
     def get_collections(self, workspace_id: str) -> Dict[str, Any]:
-        return self.call_tool("getCollections", {"workspaceId": workspace_id}) or {}
+        # returns: { "collections": [...] }
+        return self.call_tool("getCollections", {"workspaceId": workspace_id})
 
     def create_collection(self, workspace_id: str, collection_obj: Dict[str, Any]) -> Dict[str, Any]:
-        return self.call_tool("createCollection", {"workspaceId": workspace_id, "collection": collection_obj}) or {}
+        # returns the created collection metadata (id, name, etc.)
+        return self.call_tool("createCollection", {
+            "workspaceId": workspace_id,
+            "collection": collection_obj
+        })
 
-    def delete_collection(self, collection_id: str) -> bool:
-        try:
-            self.call_tool("deleteCollection", {"collectionId": collection_id})
-            return True
-        except MCPError:
-            return False
-
-    def try_update_collection(self, collection_id: str, collection_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def create_or_update_collection(self, workspace_id: str, name: str, collection_obj: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Attempt update if the tool exists. Return None if tool not found/unsupported.
+        If a collection with 'name' exists in the workspace, delete it then create a fresh one.
+        (Some MCP deployments expose only create/list; this is a safe upsert.)
         """
-        try:
-            return self.call_tool("updateCollection", {"collectionId": collection_id, "collection": collection_obj})
-        except MCPError as e:
-            # Tool not found or not supported – report None so caller can fallback.
-            msg = str(e).lower()
-            if "tool updatecollection not found" in msg or "method not found" in msg or "-32601" in msg:
-                return None
-            # Other MCP errors should propagate (bad payload, etc.)
-            raise
-
-    def upsert_collection(
-        self,
-        workspace_id: str,
-        collection_obj: Dict[str, Any],
-        existing_id: Optional[str] = None,
-        allow_delete_fallback: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Preferred entrypoint: updates if possible; otherwise gracefully creates.
-        If update isn't supported and create conflicts, optionally deletes then creates.
-        """
-        if existing_id:
-            updated = self.try_update_collection(existing_id, collection_obj)
-            if updated is not None:
-                return updated
-
-        # No update tool: try create
-        try:
-            return self.create_collection(workspace_id, collection_obj)
-        except MCPError as e:
-            # Try a delete+create if create failed due to conflict and we know an existing id
-            msg = str(e).lower()
-            if existing_id and allow_delete_fallback and ("already exists" in msg or "conflict" in msg):
-                if self.delete_collection(existing_id):
-                    return self.create_collection(workspace_id, collection_obj)
-            # Last resort: rename and create to avoid name collisions
-            renamed = collection_obj.copy()
-            info = renamed.setdefault("info", {})
-            base_name = info.get("name") or "security test collection"
-            info["name"] = f"{base_name} (recreated {int(time.time())})"
-            return self.create_collection(workspace_id, renamed)
+        cols = self.get_collections(workspace_id).get("collections", [])
+        existing = next((c for c in cols if c.get("name") == name), None)
+        if existing:
+            # If server has delete tool, use it; otherwise create another copy with unique name.
+            try:
+                self.call_tool("deleteCollection", {"collectionId": existing["id"]})
+            except MCPClientError:
+                pass
+        return self.create_collection(workspace_id, collection_obj)
