@@ -1,85 +1,96 @@
 #!/usr/bin/env python3
-import os, json, uuid, requests
+import os
+import json
+import uuid
+import requests
 from typing import Dict, Any, List
+
 
 class PostmanMCP:
     """
-    Resilient JSON-RPC client for the Postman MCP full server.
+    Resilient JSON-RPC client for the Postman MCP full server (US region only).
 
-    It will automatically try:
-      - url permutations: given URL, with/without trailing slash
-      - host permutations: US + EU
-      - header permutations: Bearer only, X-API-Key only, both
-      - content negotiation permutations: Accept & Content-Type combos
+    Behavior:
+      - Uses US URL only (default https://mcp.postman.com/mcp), or POSTMAN_MCP_URL if provided.
+      - Tries with and without trailing slash.
+      - Tries header permutations (Bearer only, X-API-Key only, both).
+      - Sets Accept to *application/json, text/event-stream* (required by server).
+      - Surfaces useful response body excerpts on errors.
 
     Env:
-      POSTMAN_MCP_URL  (optional, defaults to US)
       POSTMAN_API_KEY  (required)
+      POSTMAN_MCP_URL  (optional, defaults to https://mcp.postman.com/mcp)
     """
 
     US_DEFAULT = "https://mcp.postman.com/mcp"
-    EU_DEFAULT = "https://mcp.eu.postman.com/mcp"
 
     def __init__(self, base_url: str | None = None, api_key: str | None = None, timeout: int = 60):
         self.api_key = api_key or os.getenv("POSTMAN_API_KEY") or os.getenv("POSTMAN_API_TOKEN")
         if not self.api_key:
             raise RuntimeError("POSTMAN_API_KEY is required for Postman MCP calls.")
 
-        # Start list of candidate endpoints we will try in order
-        env_url = (base_url or os.getenv("POSTMAN_MCP_URL") or "").strip().rstrip("/")
-        candidates: List[str] = []
-        if env_url:
-            candidates.append(env_url)
-        candidates.extend([self.US_DEFAULT, self.EU_DEFAULT])
-
-        # normalize and add with/without trailing slash
-        urls = []
-        for u in candidates:
+        # Build the small set of URL candidates (US only), with/without trailing slash
+        env_url = (base_url or os.getenv("POSTMAN_MCP_URL") or self.US_DEFAULT).strip().rstrip("/")
+        urls: List[str] = []
+        for u in (env_url, self.US_DEFAULT):
             u = u.rstrip("/")
             if u not in urls:
                 urls.append(u)
             if f"{u}/" not in urls:
                 urls.append(f"{u}/")
-
         self.urls = urls
+
         self.timeout = timeout
 
     # ---------- internal permutations ----------
 
     def _header_permutations(self) -> List[Dict[str, str]]:
-        common = {
-            "User-Agent": "smart-api-security-agent/1.0",
-        }
+        """
+        The server requires clients to accept BOTH application/json and text/event-stream.
+        We always include that combination (with a wildcard variant too).
+        """
+        common = {"User-Agent": "smart-api-security-agent/1.0"}
+        accept_required = "application/json, text/event-stream"
+        accept_plus_wild = f"{accept_required}, */*"
+
         return [
-            # both
+            # both auth hints; strict Accept (required)
             {
                 **common,
                 "Authorization": f"Bearer {self.api_key}",
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json",
-                "Accept": "application/json, text/plain, */*",
+                "Accept": accept_required,
             },
-            # bearer only
+            # both auth; Accept with wildcard
+            {
+                **common,
+                "Authorization": f"Bearer {self.api_key}",
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json",
+                "Accept": accept_plus_wild,
+            },
+            # bearer only; strict Accept
             {
                 **common,
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "Accept": "application/json, */*",
+                "Accept": accept_required,
             },
-            # x-api-key only
+            # x-api-key only; strict Accept
             {
                 **common,
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json",
-                "Accept": "application/json, */*",
+                "Accept": accept_required,
             },
-            # jsonrpc-ish (some gateways are picky)
+            # charset variant
             {
                 **common,
                 "Authorization": f"Bearer {self.api_key}",
                 "X-API-Key": self.api_key,
                 "Content-Type": "application/json; charset=utf-8",
-                "Accept": "*/*",
+                "Accept": accept_required,
             },
         ]
 
@@ -88,9 +99,10 @@ class PostmanMCP:
     def _rpc(self, url: str, headers: Dict[str, str], method: str, params: Dict[str, Any]):
         rid = str(uuid.uuid4())
         payload = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+
         r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=self.timeout)
 
-        # Surface useful details on negotiation errors
+        # Negotation error is explicit from the gateway, surface details
         if r.status_code == 406:
             raise requests.HTTPError(
                 f"406 Not Acceptable from {url} "
@@ -125,7 +137,7 @@ class PostmanMCP:
         # If we get here, all attempts failed
         raise last_err or RuntimeError("MCP call failed after all retries")
 
-    # ---------- public helpers ----------
+    # ---------- public helpers (tools) ----------
 
     def call_tool(self, name: str, arguments: Dict[str, Any]):
         return self._rpc_with_fallbacks("tools/call", {"name": name, "arguments": arguments})
@@ -133,7 +145,14 @@ class PostmanMCP:
     def list_tools(self):
         return self._rpc_with_fallbacks("tools/list", {})
 
+    # ---------- shape fixups ----------
+
     def _coerce_text_json(self, raw):
+        """
+        Many MCP tools return:
+          {"content":[{"type":"text","text":"<json or text>"}]}
+        Try to parse that text as JSON; if it fails, return {"text": "..."}.
+        """
         if isinstance(raw, dict) and "content" in raw:
             for c in raw.get("content") or []:
                 if isinstance(c, dict) and c.get("type") == "text":
@@ -143,6 +162,8 @@ class PostmanMCP:
                     except Exception:
                         return {"text": txt}
         return raw
+
+    # ---------- convenience wrappers ----------
 
     def get_workspaces(self):
         out = self.call_tool("getWorkspaces", {})
