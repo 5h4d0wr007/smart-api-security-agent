@@ -1,192 +1,309 @@
+#!/usr/bin/env python3
 import os
 import json
 import argparse
+import uuid
+import re
 import time
-from typing import Any, Dict, List, Tuple, Optional  # ✅ Optional added here
+import sys
+from pathlib import Path
+from mcp_client import PostmanMCP
 
-from openai import OpenAI  # pip install openai>=2
-from mcp_client import PostmanMCPClient
+# --------------------- Utilities ---------------------
 
+def fail(msg: str):
+    print(f"[agent] ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
 
-OWASP_TOP10 = [
-    "API1:2023 – Broken Object Level Authorization (BOLA)",
-    "API2:2023 – Broken Authentication",
-    "API3:2023 – Broken Object Property Level Authorization (BOPLA)",
-    "API4:2023 – Unrestricted Resource Consumption",
-    "API5:2023 – Broken Function Level Authorization (BFLA)",
-    "API6:2023 – Unrestricted Access to Sensitive Business Flows",
-    "API7:2023 – Server Side Request Forgery",
-    "API8:2023 – Security Misconfiguration",
-    "API9:2023 – Improper Inventory Management",
-    "API10:2023 – Unsafe Consumption of APIs",
-]
+def read_text(path: str, limit: int = 20000) -> str:
+    """Read a text file, truncate for prompt if huge."""
+    try:
+        s = Path(path).read_text(encoding="utf-8", errors="ignore")
+        if len(s) > limit:
+            head = s[: int(limit * 0.6)]
+            tail = s[-int(limit * 0.4) :]
+            return head + "\n...<truncated>...\n" + tail
+        return s
+    except Exception:
+        return ""
 
+def load_json(path: str):
+    try:
+        return json.loads(Path(path).read_text())
+    except Exception:
+        return {}
 
-def load_file(p: str) -> str:
-    with open(p, "r", encoding="utf-8") as f:
-        return f.read()
+def robust_json_load(s: str):
+    """Parse JSON; tolerate code fences."""
+    try:
+        return json.loads(s)
+    except Exception:
+        s2 = s.strip()
+        if s2.startswith("```"):
+            s2 = re.sub(r"^```(json)?", "", s2).rstrip("`").strip()
+        return json.loads(s2)
 
+def parse_oasdiff_paths(diff_json: dict):
+    """Extract changed/added paths from oasdiff output."""
+    ep = set()
+    pd = diff_json.get("pathsDiff", {})
+    for key in ("added", "modified"):
+        for v in pd.get(key, []) or []:
+            if isinstance(v, str):
+                ep.add(v)
+            elif isinstance(v, dict) and v.get("path"):
+                ep.add(v["path"])
+    return sorted(ep)
 
-def read_json(p: str) -> Any:
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+# --------------------- Validation ---------------------
 
+ALLOWED_PERSONAS = {"unauth", "owner", "x-tenant", "admin"}
+ALLOWED_METHODS = {"GET", "POST", "PATCH", "PUT", "DELETE", "HEAD", "OPTIONS"}
 
-def write_json(p: str, obj: Any) -> None:
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
+def validate_plan(obj: dict):
+    """Validate LLM result structure."""
+    if not isinstance(obj, dict):
+        fail("LLM output is not a JSON object.")
+    risks = obj.get("risks")
+    tests = obj.get("tests")
+    if not isinstance(risks, list):
+        fail("Missing 'risks' array in LLM output.")
+    if not isinstance(tests, list) or not tests:
+        fail("Missing non-empty 'tests' array in LLM output.")
+    if len(tests) > 20:
+        fail("LLM returned too many tests (>20).")
+    for r in risks:
+        if not isinstance(r, dict) or not {"id", "severity", "explanation"} <= r.keys():
+            fail("Each risk must include id, severity, explanation.")
+    for t in tests:
+        for k in ("name", "method", "path", "persona", "expectedStatus"):
+            if k not in t:
+                fail(f"Test missing field: {k}")
+        if t["persona"] not in ALLOWED_PERSONAS:
+            fail(f"Invalid persona '{t['persona']}'. Allowed: {sorted(ALLOWED_PERSONAS)}")
+        if str(t["method"]).upper() not in ALLOWED_METHODS:
+            fail(f"Invalid HTTP method '{t['method']}'.")
+        try:
+            int(t["expectedStatus"])
+        except Exception:
+            fail("expectedStatus must be an integer.")
+    return {"risks": risks, "tests": tests}
 
+# --------------------- OpenAI ---------------------
 
-def llm_plan_and_tests(openai_key: str, base_spec: str, head_spec: str, diff_json: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    Ask the LLM to:
-      1) Identify risks (OWASP API Top 10 inspired) from the HEAD spec and diff.
-      2) Emit a Postman collection with executable tests and dynamic variables ({{userId}}, etc.).
-    """
-    client = OpenAI(api_key=openai_key)
-
-    sys = (
-        "You are an API security expert. Generate targeted security tests from an OpenAPI spec and its diff. "
-        "Focus on OWASP API Top 10. Emit a valid Postman v2.1 collection that uses dynamic variables and sets "
-        "pm.test(...) assertions to validate expected security behavior. Use auth headers or cookies as variables "
-        "({{ownerToken}}, {{xTenant}}, etc.). Where path parameters exist, reference Postman variables like "
-        "{{userId}}, and add pre-request scripts to set them when needed."
+def llm_call(system: str, user: str, model="gpt-4o-mini", max_tokens=2200, temperature=0.2) -> str:
+    """Call OpenAI Chat Completions with JSON response format."""
+    from openai import OpenAI
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        fail("OPENAI_API_KEY is required for LLM agent.")
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+        response_format={"type": "json_object"},
     )
+    return resp.choices[0].message.content
 
-    user = {
-        "base_spec": base_spec,
-        "head_spec": head_spec,
-        "diff": diff_json,
-        "owasp": OWASP_TOP10,
-        "expectations": [
-            "Include negative tests for BOLA/BOPLA/BFLA using two users: user 1 (owner) and user 2 (other).",
-            "Use environment vars: ownerUserId=1, otherUserId=2, ownerToken=t1, otherToken=t2.",
-            "Replace any {id}-style path params with Postman variables in the request URL (e.g., /users/{{userId}}/profile).",
-            "Assertions should check 401 for unauthenticated, 403 for cross-tenant/role violations, 200/202 for owner-allowed.",
-            "If an endpoint doesn’t exist, assert 404 to mark gap.",
+# --------------------- Postman Collection Builders ---------------------
+
+def pm_header(k, v):
+    return {"key": k, "value": v}
+
+def pm_script(js: str):
+    return {"type": "text/javascript", "exec": js.splitlines()}
+
+TEST_JS = "function expect(c){pm.test(pm.info.requestName,function(){pm.response.to.have.status(c);});}"
+
+def pm_item(t: dict):
+    method = str(t["method"]).upper()
+    path = str(t["path"])
+    raw = "http://127.0.0.1:8000" + path
+    headers = []
+    persona = t["persona"]
+    if persona == "owner":
+        headers.append(pm_header("Authorization", "Bearer {{t1}}"))
+    elif persona == "x-tenant":
+        headers.append(pm_header("Authorization", "Bearer {{t2}}"))
+    elif persona == "admin":
+        headers.append(pm_header("Authorization", "Bearer {{admin}}"))
+
+    item = {
+        "name": t["name"],
+        "request": {
+            "method": method,
+            "header": headers,
+            "url": {
+                "raw": raw,
+                "protocol": "http",
+                "host": ["127.0.0.1"],
+                "port": "8000",
+                "path": [p for p in path.strip("/").split("/") if p],
+            },
+        },
+        "event": [
+            {"listen": "test", "script": pm_script(TEST_JS + f"expect({int(t['expectedStatus'])});")}
         ],
     }
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": json.dumps(user)},
-        ],
-        response_format={"type": "json_object"},
-    )
+    if "body" in t and t["body"] is not None:
+        item["request"]["header"] = item["request"].get("header", []) + [
+            pm_header("Content-Type", "application/json")
+        ]
+        item["request"]["body"] = {"mode": "raw", "raw": json.dumps(t["body"])}
 
-    content = completion.choices[0].message.content
-    try:
-        data = json.loads(content)
-    except Exception:
-        data = {"plan": {"notes": "Non-JSON from LLM", "raw": content}, "postman_collection": {}}
+    return item
 
-    plan = data.get("plan") or {"summary": "Security plan generated", "risks": [], "notes": "No plan chunk present from LLM."}
-    collection = data.get("postman_collection") or {}
+def build_env_vars():
+    return {
+        "t1": "t1",
+        "t2": "t2",
+        "admin": "admin",
+        "userId": "1",
+        "userIdOwner": "1",
+        "userIdCross": "2",
+        "accountId": "101",
+        "accountIdOwner": "101",
+        "accountIdCross": "102",
+        "orderId": "201",
+        "orderIdOwner": "201",
+        "orderIdCross": "202",
+    }
 
-    info = collection.setdefault("info", {})
-    info.setdefault("name", "security test collection")
-    info.setdefault("_postman_id", "auto-generated")
-    info.setdefault("schema", "https://schema.getpostman.com/json/collection/v2.1.0/collection.json")
+def to_collection(name: str, tests: list):
+    env = build_env_vars()
+    return {
+        "info": {
+            "name": name,
+            "_postman_id": str(uuid.uuid4()),
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+        },
+        "item": [pm_item(t) for t in tests],
+        "variable": [{"key": k, "value": v} for k, v in env.items()],
+    }
 
-    collection.setdefault("item", [])
-    events = collection.setdefault("event", [])
-    bootstrap_script = (
-        "if (!pm.environment.get('ownerUserId')) { pm.environment.set('ownerUserId', '1'); }\n"
-        "if (!pm.environment.get('otherUserId')) { pm.environment.set('otherUserId', '2'); }\n"
-        "if (!pm.environment.get('ownerToken')) { pm.environment.set('ownerToken', 't1'); }\n"
-        "if (!pm.environment.get('otherToken')) { pm.environment.set('otherToken', 't2'); }\n"
-        "if (!pm.environment.get('baseUrl')) { pm.environment.set('baseUrl', 'http://127.0.0.1:8000'); }\n"
-        "pm.globals.set('userId', pm.environment.get('ownerUserId'));\n"
-        "pm.globals.set('accountId', '101');\n"
-        "pm.globals.set('orderId', '201');\n"
-    )
-    events.append({
-        "listen": "prerequest",
-        "script": {"type": "text/javascript", "exec": bootstrap_script.splitlines()},
-    })
+# --------------------- Prompts ---------------------
 
-    return plan, collection
+PROMPT_SYSTEM = """You are an API security expert.
+Given an OpenAPI diff and the HEAD spec, map changes to OWASP API Top 10 (API1..API10).
+Propose HTTP tests per persona to confirm/deny risks. Return STRICT JSON only (no prose).
+Limit to <= 15 tests.
+"""
 
+PROMPT_USER_TMPL = """OpenAPI DIFF:
+{diff_txt}
 
-def select_workspace_id(mcp: PostmanMCPClient, desired_name: Optional[str]) -> str:
-    ws = mcp.get_workspaces() or {}
-    arr = ws.get("workspaces") or []
-    if desired_name:
-        for w in arr:
-            if w.get("name") == desired_name:
-                return w.get("id")
-    if not arr:
-        raise RuntimeError("No Postman workspaces visible via MCP")
-    return arr[0].get("id")
+HEAD SPEC:
+{head_txt}
 
+Output JSON schema:
+{{
+  "risks": [
+    {{
+      "id": "API1:BOLA",
+      "severity": "high",
+      "explanation": "short reason",
+      "targets": ["/path"]
+    }}
+  ],
+  "tests": [
+    {{
+      "name": "short test name",
+      "method": "GET|POST|PATCH|PUT|DELETE",
+      "path": "/path",
+      "persona": "unauth|owner|x-tenant|admin",
+      "expectedStatus": 200,
+      "body": {{}}  // optional
+    }}
+  ]
+}}
+Personas:
+- unauth: no token
+- owner:  t1
+- x-tenant: t2
+- admin: admin
+Return ONLY JSON.
+"""
 
-def find_existing_collection_id(mcp: PostmanMCPClient, workspace_id: str, name: str) -> Optional[str]:
-    cols = mcp.get_collections(workspace_id) or {}
-    for c in cols.get("collections", []):
-        if (c.get("name") or "").strip().lower() == name.strip().lower():
-            return c.get("id")
-    return None
-
+# --------------------- Main ---------------------
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base", required=True)
-    parser.add_argument("--head", required=True)
-    parser.add_argument("--diff", default="diff.json")
-    parser.add_argument("--collection", default="security test collection")
-    parser.add_argument("--plan", default="plan.json")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base", default="openapi/api.v1.yaml")
+    ap.add_argument("--head", default="openapi/api.yaml")
+    ap.add_argument("--diff", default="diff.json")
+    ap.add_argument("--collection", default="security test collection")
+    ap.add_argument("--plan", default="plan.json")
+    ap.add_argument("--workspace_name", default=os.getenv("POSTMAN_WORKSPACE_NAME", "Security Demo"))
+    ap.add_argument("--env_name", default=os.getenv("POSTMAN_ENV_NAME", "Security Demo Env"))
+    ap.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    args = ap.parse_args()
 
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        raise RuntimeError("OPENAI_API_KEY must be set")
-
-    postman_url = os.getenv("POSTMAN_MCP_URL")
-    postman_key = os.getenv("POSTMAN_API_KEY")
-    if not postman_url or not postman_key:
-        raise RuntimeError("POSTMAN_MCP_URL and POSTMAN_API_KEY must be set")
-
-    base_spec = load_file(args.base)
-    head_spec = load_file(args.head)
-    diff_json = {}
-    if os.path.exists(args.diff):
-        try:
-            diff_json = read_json(args.diff)
-        except Exception:
-            diff_json = {}
+    # ---- Compose prompt from diff + head spec
+    diff_txt = read_text(args.diff)
+    head_txt = read_text(args.head)
 
     print("[agent] Calling LLM for risk and test generation...")
-    plan, collection = llm_plan_and_tests(openai_key, base_spec, head_spec, diff_json)
-    write_json(args.plan, plan)
+    raw = llm_call(PROMPT_SYSTEM, PROMPT_USER_TMPL.format(diff_txt=diff_txt, head_txt=head_txt), model=args.model)
+    Path("llm_raw.json").write_text(raw)
 
-    for item in collection.get("item", []):
-        req = item.get("request") or {}
-        if isinstance(req.get("url"), str):
-            if url := req.get("url"):
-                req["url"] = url.replace("http://127.0.0.1:8000", "{{baseUrl}}")
-        elif isinstance(req.get("url"), dict):
-            u = req["url"]
-            if isinstance(u.get("raw"), str):
-                u["raw"] = u["raw"].replace("http://127.0.0.1:8000", "{{baseUrl}}")
+    obj = robust_json_load(raw)
+    plan = validate_plan(obj)
 
-    write_json("generated-security-test.postman_collection.json", collection)
+    # Normalize plan output
+    plan_out = {
+        "generatedAt": int(time.time()),
+        "endpointsAnalyzed": parse_oasdiff_paths(load_json(args.diff)),
+        "risks": plan["risks"],
+        "tests": plan["tests"],
+        "personas": [
+            {"id": "unauth", "token": None},
+            {"id": "owner", "token": "t1"},
+            {"id": "x-tenant", "token": "t2"},
+            {"id": "admin", "token": "admin"},
+        ],
+    }
+    Path(args.plan).write_text(json.dumps(plan_out, indent=2))
 
+    # Build local collection for CLI run
+    coll = to_collection(args.collection, plan_out["tests"])
+    Path("generated-security-test.postman_collection.json").write_text(json.dumps(coll, indent=2))
+
+    # ---- Push to Postman via MCP full server
     print("[agent] Pushing generated collection to Postman MCP...")
-    mcp = PostmanMCPClient(base_url=postman_url, api_key=postman_key)
-    ws_name = os.getenv("POSTMAN_WORKSPACE_NAME")
-    workspace_id = select_workspace_id(mcp, ws_name)
+    mcp = PostmanMCP()
 
-    desired_name = args.collection or "security test collection"
-    collection["info"]["name"] = desired_name
-    existing_id = find_existing_collection_id(mcp, workspace_id, desired_name)
+    # 1) Resolve workspace
+    ws = mcp.get_workspaces() or {}
+    all_ws = ws.get("workspaces") or []
+    workspace = next((w for w in all_ws if w.get("name") == args.workspace_name), None)
+    if not workspace:
+        raise RuntimeError(
+            f"Workspace '{args.workspace_name}' not found via MCP. "
+            f"Available: {[w.get('name') for w in all_ws]}"
+        )
+    workspace_id = workspace["id"]
 
-    mcp.upsert_collection(workspace_id, collection, existing_id=existing_id)
+    # 2) Upsert environment with tokens and ids
+    mcp.upsert_environment(workspace_id, args.env_name, build_env_vars())
+
+    # 3) Create or update collection by name
+    cols = mcp.get_collections(workspace_id) or {}
+    existing = next((c for c in (cols.get("collections") or []) if c.get("name") == args.collection), None)
+
+    if existing:
+        mcp.update_collection(existing["id"], coll)
+        print(f"[agent] Updated existing collection (id={existing['id']})")
+    else:
+        mcp.create_collection(workspace_id, coll)
+        print("[agent] Created new collection in Postman workspace.")
 
     print("[agent] plan.json + collection generated and synced with MCP.")
-
 
 if __name__ == "__main__":
     main()
