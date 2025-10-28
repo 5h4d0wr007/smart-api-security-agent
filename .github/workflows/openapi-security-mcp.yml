@@ -15,7 +15,7 @@ permissions:
 
 env:
   POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
-  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Smart API Security Agent
   POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
 
 jobs:
