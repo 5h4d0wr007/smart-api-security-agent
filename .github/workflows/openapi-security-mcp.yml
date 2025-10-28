@@ -16,9 +16,10 @@ permissions:
   pull-requests: write
 
 env:
-  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
-  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
-  POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
+  POSTMAN_MCP_URL: https://mcp.postman.com/mcp
+  POSTMAN_WORKSPACE_NAME: Smart API Security Agent
+  POSTMAN_ENV_NAME: SASA Env
+  POSTMAN_CLI_DISABLE_TELEMETRY: "true"
 
 jobs:
   test-on-openapi-change:
@@ -87,8 +88,8 @@ jobs:
       - name: Compute OpenAPI diff (base vs head)
         run: |
           set -euo pipefail
-          BASE=origin/${{ github.base_ref }}
-          HEAD=origin/${{ github.head_ref }}
+          BASE=origin/${{ github.base_ref || 'main' }}
+          HEAD=origin/${{ github.head_ref || github.ref_name }}
           mkdir -p .tmp
           FILE=$(git diff --name-only "$BASE...$HEAD" | grep -E '^openapi/.*\.(ya?ml|json)$' | head -n1 || true)
           if [ -z "${FILE:-}" ]; then
@@ -99,6 +100,7 @@ jobs:
             git show "$HEAD:$FILE" > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
             swagger-cli validate .tmp/base.yaml
             swagger-cli validate .tmp/head.yaml
+            oasdiff diff --format json .tmp/base.yaml .tmp.head.yaml > /dev/null 2>&1 || true
             oasdiff diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
           fi
           echo "Wrote diff.json"
@@ -114,6 +116,76 @@ jobs:
             --diff diff.json \
             --collection "security test collection" \
             --plan plan.json
+          test -f generated-security-test.postman_collection.json
+
+      # --- NEW: Normalize placeholders {id} → {{id}} for Postman runtime ---
+      - name: Normalize path placeholders for Postman
+        run: |
+          python - <<'PY'
+import json, re
+p='generated-security-test.postman_collection.json'
+j=json.load(open(p))
+def fix_item(item):
+    if isinstance(item, dict):
+        if 'request' in item and 'url' in item['request']:
+            url=item['request']['url']
+            if isinstance(url, dict) and 'raw' in url:
+                raw=url['raw']
+                raw_new=re.sub(r'\{([A-Za-z0-9_]+)\}', r'{{\\1}}', raw)
+                if raw_new!=raw:
+                    url['raw']=raw_new
+            elif isinstance(url, str):
+                url_new=re.sub(r'\{([A-Za-z0-9_]+)\}', r'{{\\1}}', url)
+                if url_new!=url:
+                    item['request']['url']=url_new
+        for k,v in list(item.items()):
+            fix_item(v)
+    elif isinstance(item, list):
+        for it in item:
+            fix_item(it)
+fix_item(j)
+with open(p,'w') as f: json.dump(j,f,indent=2)
+print("Placeholders normalized in collection.")
+PY
+
+      # --- NEW: Build a Postman environment from LLM plan (with smart defaults) ---
+      - name: Build Postman environment (env.json)
+        run: |
+          python - <<'PY'
+import json, os, pathlib
+# Defaults for the demo app in "vulnerable" behavior
+env = {
+  "id": "auto-env",
+  "name": "SASA Env",
+  "values": [
+    {"key":"baseUrl","value":"http://127.0.0.1:8000","type":"text","enabled":True},
+    {"key":"ownerUserId","value":"1","type":"text","enabled":True},
+    {"key":"otherUserId","value":"2","type":"text","enabled":True},
+    {"key":"ownerToken","value":"t1","type":"text","enabled":True},
+    {"key":"otherToken","value":"t2","type":"text","enabled":True},
+    {"key":"adminToken","value":"admin","type":"text","enabled":True},
+    {"key":"orderIdOwner","value":"201","type":"text","enabled":True},
+    {"key":"orderIdOther","value":"202","type":"text","enabled":True},
+    {"key":"accountIdOwner","value":"101","type":"text","enabled":True},
+    {"key":"accountIdOther","value":"102","type":"text","enabled":True}
+  ]
+}
+# If LLM wrote plan.json with better IDs/tokens, merge them in
+try:
+  plan = json.load(open('plan.json'))
+  for k in ["baseUrl","ownerUserId","otherUserId","ownerToken","otherToken","adminToken",
+            "orderIdOwner","orderIdOther","accountIdOwner","accountIdOther"]:
+    v = plan.get("environment",{}).get(k)
+    if v:
+      for e in env["values"]:
+        if e["key"]==k:
+          e["value"]=str(v)
+except FileNotFoundError:
+  pass
+pathlib.Path('env.json').write_text(json.dumps(env,indent=2))
+print("env.json written.")
+PY
+          cat env.json
 
       - name: Postman CLI login (non-interactive)
         env:
@@ -125,66 +197,71 @@ jobs:
         continue-on-error: true
         run: |
           postman collection run ./generated-security-test.postman_collection.json \
+            --environment ./env.json \
             --reporters cli,json \
             --reporter-json-export run.json \
           || true
           # ensure run.json exists so the next step never crashes
           [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+          ls -l run.json
 
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # === Sticky PR comment + Job Summary (robust output) ===
+      # --- FIXED: Build PR summary using a heredoc Node script (no shell expansion issues) ---
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
-          node -e "
-            const fs=require('fs');
-            const s=JSON.parse(fs.readFileSync('sarif.json','utf8'));
-            const res=((s.runs||[{}])[0].results)||[];
-            const total=res.length;
-            const emoji=(l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
-            const lines=[];
-            lines.push('**Postman Security Test Agent — Findings**');
+          cat <<'NODE_SCRIPT' > build_summary.js
+          const fs = require('fs');
+          const s = JSON.parse(fs.readFileSync('sarif.json','utf8'));
+          const res = ((s.runs||[{}])[0].results)||[];
+          const total = res.length;
+          const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
+          const lines=[];
+          lines.push('**Postman Security Test Agent — Findings**');
+          lines.push('');
+          lines.push(`Detected **${total}** finding${total===1?'':'s'}.`);
+          if(total===0){
             lines.push('');
-            lines.push(`Detected **${total}** finding${total===1?'':'s'}.`);
-            if(total===0){
-              lines.push('');
-              lines.push('> ✅ No security test failures detected');
-            }else{
-              lines.push('');
-              lines.push('|  | Severity | Finding |');
-              lines.push('|---|---|---|');
-              for(const r of res){
-                const lvl=r.level||'note';
-                const msg=(r.message&&r.message.text)||'(no message)';
-                lines.push(`| ${emoji(lvl)} | ${lvl} | ${msg} |`);
-              }
+            lines.push('> ✅ No security test failures detected');
+          }else{
+            lines.push('');
+            lines.push('|  | Severity | Finding |');
+            lines.push('|---|---|---|');
+            for(const r of res){
+              const lvl=r.level||'note';
+              const msg=(r.message&&r.message.text)||'(no message)';
+              lines.push(`| ${emoji(lvl)} | ${lvl} | ${msg} |`);
             }
-            lines.push('');
-            lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
-            fs.writeFileSync('sarif_summary.md',lines.join('\\n'));
-          "
+          }
+          lines.push('');
+          lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
+          fs.writeFileSync('sarif_summary.md', lines.join('\n'));
+          NODE_SCRIPT
+          node build_summary.js
+          cat sarif_summary.md
 
-      - uses: marocchino/sticky-pull-request-comment@v2
-        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+      - name: Post sticky PR comment
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: Postman Security Summary
           path: sarif_summary.md
 
-      # Upload SARIF pinned to PR head (only same-repo PRs / pushes)
+      # Upload SARIF to GitHub Code Scanning (pin to PR head ref/sha)
       - name: Upload SARIF to GitHub Code Scanning
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        if: github.event_name == 'pull_request'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: sarif.json
           category: openapi-postman-security
-          ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
-          sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          ref: refs/heads/${{ github.head_ref }}
+          sha: ${{ github.event.pull_request.head.sha }}
+          wait-for-processing: true
 
-      # Keep artifacts for download/debug
-      - name: Upload artifacts (diff, plan, run, sarif, collection)
+      - name: Upload artifacts (diff, plan, run, sarif, collection, env)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -194,6 +271,7 @@ jobs:
             plan.json
             run.json
             sarif.json
+            env.json
             generated-security-test.postman_collection.json
 
       - name: Stop sample app
