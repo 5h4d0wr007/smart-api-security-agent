@@ -113,61 +113,6 @@ jobs:
             --collection "security test collection" \
             --plan plan.json
 
-      # ---------- minimal additions start ----------
-      - name: Normalize placeholders {id} → {{id}} in generated collection
-        run: |
-          python - <<'PY'
-import json, re, sys
-p='generated-security-test.postman_collection.json'
-j=json.load(open(p))
-def walk(x):
-  if isinstance(x, dict):
-    if x.get('request') and isinstance(x['request'].get('url'), dict):
-      raw = x['request']['url'].get('raw')
-      if isinstance(raw, str):
-        x['request']['url']['raw'] = re.sub(r'\{([A-Za-z0-9_]+)\}', r'{{\\1}}', raw)
-    for v in x.values(): walk(v)
-  elif isinstance(x, list):
-    for v in x: walk(v)
-walk(j)
-open(p,'w').write(json.dumps(j,indent=2))
-print("Placeholders normalized → mustache.")
-PY
-
-      - name: Build Postman environment (env.json) for dynamic IDs/tokens
-        run: |
-          python - <<'PY'
-import json, pathlib
-env = {
-  "id": "auto-env",
-  "name": "SASA Env",
-  "values": [
-    {"key":"baseUrl","value":"http://127.0.0.1:8000","type":"text","enabled":True},
-    {"key":"ownerUserId","value":"1","type":"text","enabled":True},
-    {"key":"otherUserId","value":"2","type":"text","enabled":True},
-    {"key":"ownerToken","value":"t1","type":"text","enabled":True},
-    {"key":"otherToken","value":"t2","type":"text","enabled":True},
-    {"key":"adminToken","value":"admin","type":"text","enabled":True},
-    {"key":"orderIdOwner","value":"201","type":"text","enabled":True},
-    {"key":"orderIdOther","value":"202","type":"text","enabled":True},
-    {"key":"accountIdOwner","value":"101","type":"text","enabled":True},
-    {"key":"accountIdOther","value":"102","type":"text","enabled":True}
-  ]
-}
-# allow the agent plan to override any defaults
-try:
-  plan = json.load(open('plan.json'))
-  for v in env["values"]:
-    k=v["key"]; new = plan.get("environment",{}).get(k)
-    if new is not None: v["value"]=str(new)
-except FileNotFoundError:
-  pass
-pathlib.Path('env.json').write_text(json.dumps(env,indent=2))
-print("env.json written with default demo values")
-PY
-          cat env.json
-      # ---------- minimal additions end ----------
-
       - name: Postman CLI login (non-interactive)
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
@@ -178,7 +123,6 @@ PY
         continue-on-error: true
         run: |
           postman collection run ./generated-security-test.postman_collection.json \
-            --environment ./env.json \
             --reporters cli,json \
             --reporter-json-export run.json
 
