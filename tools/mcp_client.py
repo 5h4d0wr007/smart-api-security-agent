@@ -1,112 +1,208 @@
-# tools/mcp_client.py
+#!/usr/bin/env python3
 import os
 import json
-import time
-from typing import Any, Dict, Optional
-
+import uuid
 import requests
+from typing import Dict, Any, List
 
 
-class MCPClientError(RuntimeError):
-    pass
+class PostmanMCP:
+    """
+    Resilient JSON-RPC client for the Postman MCP full server (US region only).
 
+    Features:
+      - Uses US URL only (https://mcp.postman.com/mcp) unless overridden by POSTMAN_MCP_URL.
+      - Sets Accept: application/json, text/event-stream (required by MCP).
+      - Detects and parses SSE (Server-Sent Events) responses.
+      - Tries with/without trailing slash and multiple auth header variants.
+      - Surfaces meaningful body text on errors.
 
-class PostmanMCPClient:
-    def __init__(self,
-                 base_url: Optional[str] = None,
-                 api_key: Optional[str] = None,
-                 timeout: int = 60):
-        self.base_url = (base_url or os.getenv("POSTMAN_MCP_URL") or "https://mcp.postman.com/mcp").rstrip("/") + "/"
-        self.api_key = api_key or os.getenv("POSTMAN_API_KEY") or ""
+    Env:
+      POSTMAN_API_KEY  (required)
+      POSTMAN_MCP_URL  (optional)
+    """
+
+    US_DEFAULT = "https://mcp.postman.com/mcp"
+
+    def __init__(self, base_url: str | None = None, api_key: str | None = None, timeout: int = 60):
+        self.api_key = api_key or os.getenv("POSTMAN_API_KEY") or os.getenv("POSTMAN_API_TOKEN")
         if not self.api_key:
-            raise MCPClientError("POSTMAN_API_KEY is not set")
+            raise RuntimeError("POSTMAN_API_KEY is required for Postman MCP calls.")
 
-        # Headers MCP expects; include the API key in multiple forms.
-        self._base_headers = {
-            "Content-Type": "application/json; charset=utf-8",
-            "Accept": "application/json, text/event-stream",
-            "x-api-key": self.api_key,
-            "X-API-Key": self.api_key,
-            "X-Postman-API-Key": self.api_key,
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "smart-api-security-agent/1.0",
-        }
+        env_url = (base_url or os.getenv("POSTMAN_MCP_URL") or self.US_DEFAULT).strip().rstrip("/")
+        urls: List[str] = []
+        for u in (env_url, self.US_DEFAULT):
+            u = u.rstrip("/")
+            if u not in urls:
+                urls.append(u)
+            if f"{u}/" not in urls:
+                urls.append(f"{u}/")
+        self.urls = urls
         self.timeout = timeout
 
-    # -------- JSON-RPC transport (compatible with your previous code) --------
+    # ---------- header permutations ----------
+    def _header_permutations(self) -> List[Dict[str, str]]:
+        """Server requires Accept: application/json, text/event-stream."""
+        common = {"User-Agent": "smart-api-security-agent/1.0"}
+        accept_required = "application/json, text/event-stream"
+        return [
+            {
+                **common,
+                "Authorization": f"Bearer {self.api_key}",
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json",
+                "Accept": accept_required,
+            },
+            {
+                **common,
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "Accept": accept_required,
+            },
+            {
+                **common,
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json",
+                "Accept": accept_required,
+            },
+            {
+                **common,
+                "Authorization": f"Bearer {self.api_key}",
+                "X-API-Key": self.api_key,
+                "Content-Type": "application/json; charset=utf-8",
+                "Accept": accept_required,
+            },
+        ]
 
-    def _rpc_with_fallbacks(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        # Single attempt (kept name so existing calls work)
-        return self._rpc(self.base_url, self._base_headers, method, params)
+    # ---------- SSE parsing ----------
+    @staticmethod
+    def _parse_sse_to_json(text: str) -> Dict[str, Any]:
+        """Extract JSON from text/event-stream payloads."""
+        if not text:
+            raise RuntimeError("Empty SSE response.")
 
-    def _rpc(self, url: str, headers: Dict[str, str], method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        payload = {"jsonrpc": "2.0", "id": int(time.time() * 1000), "method": method, "params": params}
-        r = requests.post(url, data=json.dumps(payload), headers=headers, timeout=self.timeout)
+        data_lines: List[str] = [ln[len("data:"):].strip() for ln in text.splitlines() if ln.startswith("data:")]
+        if not data_lines:
+            # fallback: find JSON braces
+            try:
+                start, end = text.find("{"), text.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    return json.loads(text[start:end + 1])
+            except Exception:
+                pass
+            raise RuntimeError(f"Unable to parse SSE content: {text[:400]}")
+        joined = "".join(data_lines).strip()
+        return json.loads(joined)
 
-        ctype = r.headers.get("Content-Type", "")
-        body = r.text
+    # ---------- core JSON-RPC ----------
+    def _rpc(self, url: str, headers: Dict[str, str], method: str, params: Dict[str, Any]):
+        rid = str(uuid.uuid4())
+        payload = {"jsonrpc": "2.0", "id": rid, "method": method, "params": params}
+        r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=self.timeout)
+        r.raise_for_status()
 
-        # JSON
-        if "application/json" in ctype:
-            data = r.json()
-        # SSE (JSON in data: lines)
-        elif "text/event-stream" in ctype or body.startswith("event:"):
-            data = self._parse_sse(body)
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "text/event-stream" in ctype or r.text.startswith("event:"):
+            data = self._parse_sse_to_json(r.text)
         else:
-            # Try parse anyway; else helpful error
             try:
                 data = r.json()
-            except Exception:
-                raise MCPClientError(f"Non-JSON response (status {r.status_code}): {body[:200]}")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Non-JSON response from {url} (status {r.status_code}): {r.text[:400]!r}"
+                ) from e
 
-        if "error" in data:
+        if isinstance(data, dict) and "error" in data and data["error"]:
             err = data["error"]
-            raise MCPClientError(f"MCP error {err.get('code')}: {err.get('message')}")
-        return data.get("result", {})
+            raise RuntimeError(f"MCP error {err.get('code')}: {err.get('message')}")
+        return data.get("result") if isinstance(data, dict) and "result" in data else data
 
-    @staticmethod
-    def _parse_sse(text: str) -> Dict[str, Any]:
-        last = None
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("data:"):
-                chunk = line[len("data:"):].strip()
-                if chunk:
-                    try:
-                        last = json.loads(chunk)
-                    except Exception:
-                        pass
-        if last is None:
-            raise MCPClientError("SSE stream contained no JSON data frames")
-        # Some gateways nest result under 'result'
-        return last.get("result", last)
+    def _rpc_with_fallbacks(self, method: str, params: Dict[str, Any]):
+        last_err: Exception | None = None
+        for url in self.urls:
+            for hdr in self._header_permutations():
+                try:
+                    return self._rpc(url, hdr, method, params)
+                except Exception as e:
+                    last_err = e
+        raise last_err or RuntimeError("MCP call failed after all retries")
 
-    # -------- Tool wrappers (names unchanged) --------
-
-    def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    # ---------- high-level tools ----------
+    def call_tool(self, name: str, arguments: Dict[str, Any]):
         return self._rpc_with_fallbacks("tools/call", {"name": name, "arguments": arguments})
 
-    def get_workspaces(self) -> Dict[str, Any]:
-        return self.call_tool("getWorkspaces", {})
+    def list_tools(self):
+        return self._rpc_with_fallbacks("tools/list", {})
 
-    def get_collections(self, workspace_id: str) -> Dict[str, Any]:
-        return self.call_tool("getCollections", {"workspaceId": workspace_id})
+    # ---------- shape normalization ----------
+    def _coerce_text_json(self, raw):
+        if isinstance(raw, dict) and "content" in raw:
+            for c in raw.get("content") or []:
+                if isinstance(c, dict) and c.get("type") == "text":
+                    txt = (c.get("text") or "").strip()
+                    try:
+                        return json.loads(txt)
+                    except Exception:
+                        return {"text": txt}
+        return raw
 
-    def create_collection(self, workspace_id: str, collection_obj: Dict[str, Any]) -> Dict[str, Any]:
-        return self.call_tool("createCollection", {"workspaceId": workspace_id, "collection": collection_obj})
+    # ---------- convenience wrappers ----------
+    def get_workspaces(self):
+        return self._coerce_text_json(self.call_tool("getWorkspaces", {}))
 
-    # Keep your code that *uses* update if it exists server-side; otherwise use create.
-    def create_or_update_collection(self, workspace_id: str, name: str, collection_obj: Dict[str, Any]) -> Dict[str, Any]:
-        cols = self.get_collections(workspace_id).get("collections", [])
-        existing = next((c for c in cols if c.get("name") == name), None)
-        if existing:
-            try:
-                # Only call if tool exists
-                return self.call_tool("updateCollection", {"collectionId": existing["id"], "collection": collection_obj})
-            except MCPClientError:
-                # Fallback: delete+create if update isn't supported
-                try:
-                    self.call_tool("deleteCollection", {"collectionId": existing["id"]})
-                except MCPClientError:
-                    pass
-        return self.create_collection(workspace_id, collection_obj)
+    def get_collections(self, workspace_id: str):
+        return self._coerce_text_json(self.call_tool("getCollections", {"workspace": workspace_id}))
+
+    def get_collection(self, collection_id: str):
+        return self._coerce_text_json(self.call_tool("getCollection", {"collectionId": collection_id}))
+
+    def create_collection(self, workspace_id: str, collection_obj: dict):
+        return self._coerce_text_json(
+            self.call_tool("createCollection", {"workspace": workspace_id, "collection": collection_obj})
+        )
+
+    def update_collection(self, collection_id: str, collection_obj: dict):
+        return self._coerce_text_json(
+            self.call_tool("updateCollection", {"collectionId": collection_id, "collection": collection_obj})
+        )
+
+    def get_environments(self, workspace_id: str):
+        return self._coerce_text_json(self.call_tool("getEnvironments", {"workspace": workspace_id}))
+
+    def create_environment(self, workspace_id: str, name: str, variables: dict):
+        return self._coerce_text_json(
+            self.call_tool(
+                "createEnvironment",
+                {
+                    "workspace": workspace_id,
+                    "environment": {
+                        "name": name,
+                        "values": [{"key": k, "value": v} for k, v in variables.items()],
+                    },
+                },
+            )
+        )
+
+    def update_environment(self, environment_id: str, name: str, variables: dict):
+        return self._coerce_text_json(
+            self.call_tool(
+                "updateEnvironment",
+                {
+                    "environmentId": environment_id,
+                    "environment": {
+                        "name": name,
+                        "values": [{"key": k, "value": v} for k, v in variables.items()],
+                    },
+                },
+            )
+        )
+
+    def upsert_environment(self, workspace_id: str, name: str, variables: dict):
+        try:
+            return self.create_environment(workspace_id, name, variables)
+        except Exception:
+            envs = self.get_environments(workspace_id) or {}
+            env = next((e for e in (envs.get("environments") or []) if e.get("name") == name), None)
+            if not env:
+                raise
+            return self.update_environment(env["id"], name, variables)
