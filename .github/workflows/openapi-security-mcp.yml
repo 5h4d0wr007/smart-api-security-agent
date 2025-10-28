@@ -2,11 +2,7 @@ name: OpenAPI → Security tests with Postman MCP
 
 on:
   pull_request:
-    paths:
-      - "openapi/**.y*ml"
-      - "openapi/**.json"
-      - "app/**"
-      - "tools/**"
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -49,9 +45,7 @@ jobs:
 
       - name: Install CLI tooling (Postman CLI + swagger-cli)
         run: |
-          # Postman CLI (official)
           curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
-          # OpenAPI validator
           npm i -g @apidevtools/swagger-cli@4
           postman --version
           swagger-cli --version
@@ -61,13 +55,11 @@ jobs:
           set -euo pipefail
           OASDIFF_VERSION="v1.10.28"
           TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
-          URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
-          URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
-          echo "Downloading oasdiff ${OASDIFF_VERSION}…"
-          if ! curl -fL "$URL_PRIMARY" -o oasdiff.tgz; then
-            echo "Primary URL failed, trying fallback…"
-            curl -fL "$URL_FALLBACK" -o oasdiff.tgz
-          fi
+          for U in \
+            "https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}" \
+            "https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"; do
+            if curl -fL "$U" -o oasdiff.tgz; then break; fi
+          done
           tar -xzf oasdiff.tgz
           chmod +x oasdiff
           sudo mv oasdiff /usr/local/bin/oasdiff
@@ -76,7 +68,6 @@ jobs:
         run: |
           python app/app.py &
           echo $! > app.pid
-          # Warm up
           for i in {1..20}; do
             if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
               echo "App is up"; break
@@ -116,7 +107,6 @@ jobs:
             --plan plan.json
           test -f generated-security-test.postman_collection.json
 
-      # Normalize {id} → {{id}} for Postman variables
       - name: Normalize path placeholders for Postman
         run: |
           python - <<'PY'
@@ -137,7 +127,6 @@ open(p,'w').write(json.dumps(j,indent=2))
 print("Placeholders normalized.")
 PY
 
-      # Build environment for dynamic variables; merge LLM-suggested env if present
       - name: Build Postman environment (env.json)
         run: |
           python - <<'PY'
@@ -186,13 +175,11 @@ PY
             --reporter-json-export run.json \
           || true
           [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
-          ls -l run.json
 
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # Build PR summary with a Node script (avoids shell interpolation issues)
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
