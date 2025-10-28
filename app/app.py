@@ -27,12 +27,7 @@ TOKENS = {
 }
 
 # --------------------------------------------------------------------
-# VULN profile to *intentionally* introduce authZ bugs.
-# Default is "demo" so you see findings on first run.
-#   - bola: cross-user profile updates allowed
-#   - bopla: cross-tenant transfers & order cancels allowed
-#   - bfla: non-admin can read admin reports
-# Export VULN_PROFILE=secure to see a clean pipeline.
+# Vulnerability profile — defaults to "demo" (vulnerable)
 # --------------------------------------------------------------------
 VULN_PROFILE = os.getenv("VULN_PROFILE", "demo").lower()
 FLAGS = {
@@ -48,17 +43,12 @@ def whoami():
         return TOKENS.get(tok)
     return None
 
-def forbidden(msg="forbidden"):
-    return jsonify({"error": msg}), 403
-
-def unauth():
-    return jsonify({"error": "unauthorized"}), 401
-
-def notfound():
-    return jsonify({"error": "not found"}), 404
+def forbidden(msg="forbidden"): return jsonify({"error": msg}), 403
+def unauth(): return jsonify({"error": "unauthorized"}), 401
+def notfound(): return jsonify({"error": "not found"}), 404
 
 # --------------------------------------------------------------------
-# Endpoints (intentionally flawed when FLAGS[...] is True)
+# Endpoints (vulnerable depending on FLAGS)
 # --------------------------------------------------------------------
 
 @app.get("/")
@@ -71,9 +61,8 @@ def admin_reports():
     if not me:
         return unauth()
     # BFLA: allow non-admins to read admin data when vulnerable
-    if not FLAGS["bfla"]:
-        if me[2] != "admin":
-            return forbidden("admin only")
+    if not FLAGS["bfla"] and me[2] != "admin":
+        return forbidden("admin only")
     return jsonify({"reports": ["sales:123", "risks:7"]})
 
 @app.patch("/users/<int:userId>/profile")
@@ -82,10 +71,8 @@ def update_profile(userId: int):
     if not me:
         return unauth()
     # BOLA: cross-user allowed when vulnerable
-    if not FLAGS["bola"]:
-        if me[0] != userId:
-            return forbidden("not your profile")
-    # pretend success
+    if not FLAGS["bola"] and me[0] != userId:
+        return forbidden("not your profile")
     return jsonify({"ok": True, "userId": userId})
 
 @app.post("/accounts/<int:accountId>/transfer")
@@ -102,7 +89,6 @@ def transfer(accountId: int):
             return forbidden("cross-tenant")
         if acct["owner_user_id"] != me[0]:
             return forbidden("not owner")
-    # pretend "validation error" to show 400 on owner in secure profile
     amount = (request.json or {}).get("amount", 0)
     if not amount or amount < 0:
         return jsonify({"error": "invalid amount"}), 400
@@ -116,7 +102,7 @@ def cancel(orderId: int):
     order = ORDERS.get(orderId)
     if not order:
         return notfound()
-    # BOPLA again for orders
+    # BOPLA again
     if not FLAGS["bopla"]:
         if order["tenant"] != me[1]:
             return forbidden("cross-tenant")
