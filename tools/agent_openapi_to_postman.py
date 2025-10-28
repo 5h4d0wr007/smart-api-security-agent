@@ -1,7 +1,8 @@
 import os
 import json
 import argparse
-from typing import Any, Dict, List, Tuple
+import time
+from typing import Any, Dict, List, Tuple, Optional  # ✅ Optional added here
 
 from openai import OpenAI  # pip install openai>=2
 from mcp_client import PostmanMCPClient
@@ -66,7 +67,6 @@ def llm_plan_and_tests(openai_key: str, base_spec: str, head_spec: str, diff_jso
         ],
     }
 
-    # Use a response_format so we can parse reliably
     completion = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0.2,
@@ -81,25 +81,17 @@ def llm_plan_and_tests(openai_key: str, base_spec: str, head_spec: str, diff_jso
     try:
         data = json.loads(content)
     except Exception:
-        # If the model didn't return strict JSON, wrap it as reason
         data = {"plan": {"notes": "Non-JSON from LLM", "raw": content}, "postman_collection": {}}
 
-    plan = data.get("plan") or {
-        "summary": "Security plan generated",
-        "risks": [],
-        "notes": "No plan chunk present from LLM.",
-    }
+    plan = data.get("plan") or {"summary": "Security plan generated", "risks": [], "notes": "No plan chunk present from LLM."}
     collection = data.get("postman_collection") or {}
 
-    # Ensure collection info and schema
     info = collection.setdefault("info", {})
     info.setdefault("name", "security test collection")
     info.setdefault("_postman_id", "auto-generated")
     info.setdefault("schema", "https://schema.getpostman.com/json/collection/v2.1.0/collection.json")
 
-    # Ensure some items exist
     collection.setdefault("item", [])
-    # Add a fallback environment bootstrap in a top-level event, so Postman variables exist
     events = collection.setdefault("event", [])
     bootstrap_script = (
         "if (!pm.environment.get('ownerUserId')) { pm.environment.set('ownerUserId', '1'); }\n"
@@ -126,7 +118,6 @@ def select_workspace_id(mcp: PostmanMCPClient, desired_name: Optional[str]) -> s
         for w in arr:
             if w.get("name") == desired_name:
                 return w.get("id")
-    # default to first
     if not arr:
         raise RuntimeError("No Postman workspaces visible via MCP")
     return arr[0].get("id")
@@ -142,11 +133,11 @@ def find_existing_collection_id(mcp: PostmanMCPClient, workspace_id: str, name: 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", required=True, help="path to base OpenAPI spec")
-    parser.add_argument("--head", required=True, help="path to head OpenAPI spec")
-    parser.add_argument("--diff", required=False, default="diff.json", help="path to diff JSON (optional)")
-    parser.add_argument("--collection", required=False, default="security test collection", help="desired collection name")
-    parser.add_argument("--plan", required=False, default="plan.json", help="path to write the plan JSON")
+    parser.add_argument("--base", required=True)
+    parser.add_argument("--head", required=True)
+    parser.add_argument("--diff", default="diff.json")
+    parser.add_argument("--collection", default="security test collection")
+    parser.add_argument("--plan", default="plan.json")
     args = parser.parse_args()
 
     openai_key = os.getenv("OPENAI_API_KEY")
@@ -171,23 +162,18 @@ def main():
     plan, collection = llm_plan_and_tests(openai_key, base_spec, head_spec, diff_json)
     write_json(args.plan, plan)
 
-    # Always make sure requests use {{baseUrl}} and variables where possible
     for item in collection.get("item", []):
         req = item.get("request") or {}
         if isinstance(req.get("url"), str):
-            url = req["url"]
-            # promote hardcoded host to {{baseUrl}}
-            if url.startswith("http://127.0.0.1:8000"):
+            if url := req.get("url"):
                 req["url"] = url.replace("http://127.0.0.1:8000", "{{baseUrl}}")
         elif isinstance(req.get("url"), dict):
             u = req["url"]
-            if isinstance(u.get("raw"), str) and "http://127.0.0.1:8000" in u["raw"]:
+            if isinstance(u.get("raw"), str):
                 u["raw"] = u["raw"].replace("http://127.0.0.1:8000", "{{baseUrl}}")
 
-    # Persist locally for Postman CLI run
     write_json("generated-security-test.postman_collection.json", collection)
 
-    # Sync with MCP (create or update, but handle lack of update tool)
     print("[agent] Pushing generated collection to Postman MCP...")
     mcp = PostmanMCPClient(base_url=postman_url, api_key=postman_key)
     ws_name = os.getenv("POSTMAN_WORKSPACE_NAME")
@@ -197,7 +183,6 @@ def main():
     collection["info"]["name"] = desired_name
     existing_id = find_existing_collection_id(mcp, workspace_id, desired_name)
 
-    # The key change: use upsert with fallback (no updateCollection dependency)
     mcp.upsert_collection(workspace_id, collection, existing_id=existing_id)
 
     print("[agent] plan.json + collection generated and synced with MCP.")
