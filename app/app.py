@@ -1,123 +1,129 @@
-from flask import Flask, jsonify, request
+from flask import Flask, request, jsonify
+import os
 
 app = Flask(__name__)
 
-# Users and tokens
+# --------------------------------------------------------------------
+# Demo data (two tenants, two users, two accounts, two orders)
+# --------------------------------------------------------------------
 USERS = {
-    "1": {"id": "1", "role": "user", "token": "t1"},
-    "2": {"id": "2", "role": "user", "token": "t2"},
-    "99": {"id": "99", "role": "admin", "token": "ta"},
-}
-
-# Data owned by users
-PROFILES = {
-    "1": {"id": "1", "email": "u1@example.com", "name": "User One"},
-    "2": {"id": "2", "email": "u2@example.com", "name": "User Two"},
+    1: {"id": 1, "tenant": "tA", "name": "Alice"},
+    2: {"id": 2, "tenant": "tB", "name": "Bob"},
 }
 ACCOUNTS = {
-    "101": {"id": "101", "owner": "1", "balance": 1200},
-    "102": {"id": "102", "owner": "2", "balance": 900},
+    101: {"id": 101, "tenant": "tA", "owner_user_id": 1, "balance": 1000},
+    102: {"id": 102, "tenant": "tB", "owner_user_id": 2, "balance": 500},
 }
 ORDERS = {
-    "201": {"id": "201", "owner": "1", "status": "placed"},
-    "202": {"id": "202", "owner": "2", "status": "placed"},
+    201: {"id": 201, "tenant": "tA", "owner_user_id": 1, "status": "NEW"},
+    202: {"id": 202, "tenant": "tB", "owner_user_id": 2, "status": "NEW"},
 }
 
-def current_user():
-    # Accept either Authorization: Bearer <token> or Cookie: session=<token>
+TOKENS = {
+    # bearer token -> (user_id, tenant, role)
+    "t1": (1, "tA", "user"),
+    "t2": (2, "tB", "user"),
+    "admin": (999, "root", "admin"),
+}
+
+# --------------------------------------------------------------------
+# VULN profile to *intentionally* introduce authZ bugs.
+# Default is "demo" so you see findings on first run.
+#   - bola: cross-user profile updates allowed
+#   - bopla: cross-tenant transfers & order cancels allowed
+#   - bfla: non-admin can read admin reports
+# Export VULN_PROFILE=secure to see a clean pipeline.
+# --------------------------------------------------------------------
+VULN_PROFILE = os.getenv("VULN_PROFILE", "demo").lower()
+FLAGS = {
+    "bola": VULN_PROFILE in ("demo", "bola", "all"),
+    "bopla": VULN_PROFILE in ("demo", "bopla", "all"),
+    "bfla": VULN_PROFILE in ("demo", "bfla", "all"),
+}
+
+def whoami():
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
-        token = auth.split(" ", 1)[1]
-    else:
-        cookie = request.headers.get("Cookie", "")
-        token = None
-        if "session=" in cookie:
-            token = cookie.split("session=", 1)[1].split(";", 1)[0]
-    if not token:
-        return None
-    for u in USERS.values():
-        if u["token"] == token:
-            return u
+        tok = auth.split(" ", 1)[1].strip()
+        return TOKENS.get(tok)
     return None
 
-# -------------------- BOLA: view another user's profile --------------------
-@app.get("/users/<userId>/profile")
-def get_profile(userId):
-    u = current_user()
-    if not u:
-        return jsonify({"error": "unauthenticated"}), 401
-    profile = PROFILES.get(userId)
-    if not profile:
-        return jsonify({"error": "not found"}), 404
-    # VULN: no owner check -> any logged-in user can view any profile
-    return jsonify(profile), 200
+def forbidden(msg="forbidden"):
+    return jsonify({"error": msg}), 403
 
-# -------------------- BFLA: edit profile (should be self-only or admin) ----
-@app.patch("/users/<userId>/profile")
-def patch_profile(userId):
-    u = current_user()
-    if not u:
-        return jsonify({"error": "unauthenticated"}), 401
-    profile = PROFILES.get(userId)
-    if not profile:
-        return jsonify({"error": "not found"}), 404
-    data = request.get_json(silent=True) or {}
-    # VULN: any user can update any profile (function-level auth missing)
-    if "email" in data:
-        profile["email"] = data["email"]
-    if "name" in data:
-        profile["name"] = data["name"]
-    return jsonify(profile), 200
+def unauth():
+    return jsonify({"error": "unauthorized"}), 401
 
-# -------------------- BOPLA/BOLA: transfer from account --------------------
-@app.post("/accounts/<accountId>/transfer")
-def transfer(accountId):
-    u = current_user()
-    if not u:
-        return jsonify({"error": "unauthenticated"}), 401
-    acc = ACCOUNTS.get(accountId)
-    if not acc:
-        return jsonify({"error": "not found"}), 404
-    data = request.get_json(silent=True) or {}
-    to_acc = data.get("toAccountId")
-    amount = data.get("amount", 0)
-    if to_acc not in ACCOUNTS:
-        return jsonify({"error": "invalid target"}), 400
-    # VULN: no ownership check -> any user can transfer from any account
-    if amount <= 0 or acc["balance"] < amount:
-        return jsonify({"error": "insufficient"}), 400
-    acc["balance"] -= amount
-    ACCOUNTS[to_acc]["balance"] += amount
-    return jsonify({"from": acc["id"], "to": to_acc, "amount": amount}), 202
+def notfound():
+    return jsonify({"error": "not found"}), 404
 
-# -------------------- BFLA: cancel order (owner-only, but missing check) ----
-@app.post("/orders/<orderId>/cancel")
-def cancel_order(orderId):
-    u = current_user()
-    if not u:
-        return jsonify({"error": "unauthenticated"}), 401
-    order = ORDERS.get(orderId)
-    if not order:
-        return jsonify({"error": "not found"}), 404
-    # VULN: no owner/admin check -> any user can cancel anyone's order
-    order["status"] = "cancelled"
-    return jsonify(order), 200
+# --------------------------------------------------------------------
+# Endpoints (intentionally flawed when FLAGS[...] is True)
+# --------------------------------------------------------------------
 
-# -------------------- Admin-only (correctly enforced) ----------------------
+@app.get("/")
+def health():
+    return jsonify({"ok": True})
+
 @app.get("/admin/reports")
 def admin_reports():
-    u = current_user()
-    if not u:
-        return jsonify({"error": "unauthenticated"}), 401
-    if u["role"] != "admin":
-        return jsonify({"error": "forbidden"}), 403
-    return jsonify({"summary": "ok", "users": len(USERS), "orders": len(ORDERS)}), 200
+    me = whoami()
+    if not me:
+        return unauth()
+    # BFLA: allow non-admins to read admin data when vulnerable
+    if not FLAGS["bfla"]:
+        if me[2] != "admin":
+            return forbidden("admin only")
+    return jsonify({"reports": ["sales:123", "risks:7"]})
 
-@app.get("/me")
-def me():
-    u = current_user()
-    if not u: return jsonify({"id": None, "role": None}), 401
-    return jsonify({"id": u["id"], "role": u["role"]})
+@app.patch("/users/<int:userId>/profile")
+def update_profile(userId: int):
+    me = whoami()
+    if not me:
+        return unauth()
+    # BOLA: cross-user allowed when vulnerable
+    if not FLAGS["bola"]:
+        if me[0] != userId:
+            return forbidden("not your profile")
+    # pretend success
+    return jsonify({"ok": True, "userId": userId})
+
+@app.post("/accounts/<int:accountId>/transfer")
+def transfer(accountId: int):
+    me = whoami()
+    if not me:
+        return unauth()
+    acct = ACCOUNTS.get(accountId)
+    if not acct:
+        return notfound()
+    # BOPLA: cross-tenant & non-owner allowed when vulnerable
+    if not FLAGS["bopla"]:
+        if acct["tenant"] != me[1]:
+            return forbidden("cross-tenant")
+        if acct["owner_user_id"] != me[0]:
+            return forbidden("not owner")
+    # pretend "validation error" to show 400 on owner in secure profile
+    amount = (request.json or {}).get("amount", 0)
+    if not amount or amount < 0:
+        return jsonify({"error": "invalid amount"}), 400
+    return jsonify({"ok": True, "id": accountId})
+
+@app.post("/orders/<int:orderId>/cancel")
+def cancel(orderId: int):
+    me = whoami()
+    if not me:
+        return unauth()
+    order = ORDERS.get(orderId)
+    if not order:
+        return notfound()
+    # BOPLA again for orders
+    if not FLAGS["bopla"]:
+        if order["tenant"] != me[1]:
+            return forbidden("cross-tenant")
+        if order["owner_user_id"] != me[0]:
+            return forbidden("not owner")
+    order["status"] = "CANCELLED"
+    return jsonify({"ok": True, "id": orderId})
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8000)
