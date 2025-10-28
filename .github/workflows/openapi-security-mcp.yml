@@ -12,8 +12,8 @@ on:
 permissions:
   contents: read
   security-events: write
-  actions: read           # needed by upload-sarif
-  pull-requests: write    # needed to post sticky PR comment
+  actions: read
+  pull-requests: write
 
 env:
   POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
@@ -105,7 +105,7 @@ jobs:
 
       - name: LLM → plan & create/overwrite collection via official Postman MCP
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
           python tools/agent_openapi_to_postman.py \
@@ -135,11 +135,37 @@ jobs:
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # === Sticky PR comment + Job Summary ===
+      # === Sticky PR comment + Job Summary (robust output) ===
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
-          node -e "const fs=require('fs');const s=JSON.parse(fs.readFileSync('sarif.json','utf8'));const res=((s.runs||[{}])[0].results)||[];const emoji=l=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';const lines=['**Postman Security Test Agent — Findings**'];if(!res.length){lines.push('\\n> ✅ No security test failures detected');}else{lines.push('\\n|  | Severity | Finding |');lines.push('|---|---|---|');for(const r of res){const msg=(r.message&&r.message.text)||'(no message)';const lvl=r.level||'note';lines.push(`| ${emoji(lvl)} | ${lvl} | ${msg} |`);}lines.push('\\n_Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run._');}fs.writeFileSync('sarif_summary.md',lines.join('\\n'));"
+          node -e "
+            const fs=require('fs');
+            const s=JSON.parse(fs.readFileSync('sarif.json','utf8'));
+            const res=((s.runs||[{}])[0].results)||[];
+            const total=res.length;
+            const emoji=(l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
+            const lines=[];
+            lines.push('**Postman Security Test Agent — Findings**');
+            lines.push('');
+            lines.push(`Detected **${total}** finding${total===1?'':'s'}.`);
+            if(total===0){
+              lines.push('');
+              lines.push('> ✅ No security test failures detected');
+            }else{
+              lines.push('');
+              lines.push('|  | Severity | Finding |');
+              lines.push('|---|---|---|');
+              for(const r of res){
+                const lvl=r.level||'note';
+                const msg=(r.message&&r.message.text)||'(no message)';
+                lines.push(`| ${emoji(lvl)} | ${lvl} | ${msg} |`);
+              }
+            }
+            lines.push('');
+            lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
+            fs.writeFileSync('sarif_summary.md',lines.join('\\n'));
+          "
 
       - uses: marocchino/sticky-pull-request-comment@v2
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
