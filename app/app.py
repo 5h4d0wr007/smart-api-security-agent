@@ -196,35 +196,27 @@ def cancel_order(orderId):
 @app.get("/admin/reports")
 def admin_reports():
     """
-    GET /admin/reports
-
-    Demo behaviors (aligned with your plan):
-      - unauth       -> 401 (blocked)
-      - owner (id=1) -> 200 (allowed)
-      - x-tenant     -> 403 (blocked)
-
-    Notes:
-      - We treat user id "1" (token t1) as the admin/owner for this demo.
+    Admin reports:
+      - unauthenticated -> 401
+      - owner (t1)      -> 200  (allowed)
+      - x-tenant (t2..) -> 403  (blocked)
     """
-    u = current_user()
-    if not u:
+    auth = request.headers.get("Authorization", "")
+    token = auth.replace("Bearer", "").strip()
+
+    if not token:
         return jsonify({"error": "unauthenticated"}), 401
 
-    # Owner (admin) succeeds
-    if str(u.get("id")) == "1":
-        # Minimal fake report payload
+    # Treat tenant owner 't1' as allowed for this demo.
+    if token == "t1":
+        # mock report payload to make it obvious the route actually succeeded
         return jsonify({
-            "report": "demo-admin-report",
-            "generatedBy": f"user:{u['id']}",
-            "items": [
-                {"name": "transfers_total", "value": 42},
-                {"name": "orders_cancelled", "value": 7},
-            ],
+            "report": "admin-metrics",
+            "totals": {"users": 2, "orders": 3, "failed_logins": 0}
         }), 200
 
-    # Everyone else blocked
+    # Everyone else is blocked from admin reports
     return jsonify({"error": "forbidden"}), 403
-
 
 @app.get("/me")
 def me():
