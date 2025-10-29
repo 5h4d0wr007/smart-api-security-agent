@@ -30,7 +30,7 @@ import json
 import os
 import sys
 from textwrap import dedent
-import time
+from string import Template
 import requests
 
 # ---- Helpers -----------------------------------------------------------------
@@ -61,13 +61,14 @@ def post_json(url, payload, headers=None):
 # ---- Prompt (HARDENED) -------------------------------------------------------
 
 PROMPT_SYSTEM = dedent("""
-You are a Security Test Agent specialized in generating **practical authorization security tests** from OpenAPI specs. Focus BOLA/BOPLA/BFLA from OWASP API top 10
-Return output ONLY in the JSON schema.
-The generated tests must be **deterministic**.
+You are a Security Test Agent specialized in generating **practical authorization tests** from OpenAPI specs.
+Return output ONLY in the JSON schema I ask for—no prose.
+The generated tests must be **minimal, deterministic, and CI-friendly**.
 Do NOT invent endpoints. Only consider endpoints that changed according to the provided oasdiff or that exist in the HEAD spec.
 """).strip()
 
-PROMPT_USER_TPL = """
+# IMPORTANT: Using Template ($vars) to avoid brace-escaping issues.
+PROMPT_USER_TPL = Template("""
 You are given:
 - BASE OpenAPI (previous version)
 - HEAD OpenAPI (current version)
@@ -115,8 +116,7 @@ OUTPUT JSON SCHEMA (MUST MATCH EXACTLY):
         "body": {"mode":"raw","raw":"{}"}
       },
       "expectedStatus": 401
-    },
-    ...
+    }
   ]
 }
 
@@ -126,12 +126,12 @@ Constraints:
 - Use provided ids consistently to represent owner vs cross-tenant attempts.
 - Absolutely no extra keys or commentary—return a single JSON object.
 --- BASE OPENAPI ---
-{base_spec}
+$base_spec
 --- HEAD OPENAPI ---
-{head_spec}
+$head_spec
 --- OASDIFF ---
-{diff_json}
-"""
+$diff_json
+""")
 
 # ---- Build Postman collection from plan --------------------------------------
 
@@ -140,11 +140,10 @@ def plan_to_postman_collection(plan_items, collection_name):
     Convert plan to a minimal Postman collection with request-level tests
     that assert only on status code, and with enforced item naming.
     """
-    # Enforce strict naming upfront to avoid leaking "owner" failures in findings:
     allowed_prefixes = ("(unauth) ", "(owner) ", "(x-tenant) ")
     clean_items = []
     for it in plan_items:
-        name = it.get("name","").strip()
+        name = (it.get("name") or "").strip()
         if not any(name.startswith(p) for p in allowed_prefixes):
             continue
         clean_items.append(it)
@@ -153,21 +152,25 @@ def plan_to_postman_collection(plan_items, collection_name):
     for it in clean_items:
         req = it["request"]
         expected = int(it["expectedStatus"])
+        test_name = it["name"]
 
         # JS test asserts only status
-        test_script = f"""pm.test("{it['name']}", function() {{
+        test_script = f"""pm.test("{test_name}", function() {{
   pm.expect(pm.response.code).to.eql({expected});
 }});"""
 
+        # Rebuild URL components for Postman
+        raw_url = req["url"]
+        path = raw_url.replace("{{baseUrl}}/","").split("/")
         pm_items.append({
-            "name": it["name"],
+            "name": test_name,
             "request": {
                 "method": req["method"],
                 "header": req.get("headers", []),
                 "url": {
-                    "raw": req["url"],
-                    "host": ["{{baseUrl}}"],  # allows Postman to substitute
-                    "path": req["url"].replace("{{baseUrl}}/","").split("/")
+                    "raw": raw_url,
+                    "host": ["{{baseUrl}}"],
+                    "path": path
                 },
                 **({"body": req["body"]} if "body" in req else {})
             },
@@ -196,16 +199,13 @@ def call_openai_for_plan(base_spec, head_spec, diff_json):
     api_key = getenv_strict("OPENAI_API_KEY")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    # OpenAI responses in “responses” API format (JSON)
     url = "https://api.openai.com/v1/responses"
     payload = {
         "model": model,
         "input": [
             {"role":"system","content": PROMPT_SYSTEM},
-            {"role":"user","content": PROMPT_USER_TPL.format(
-                base_spec=base_spec,
-                head_spec=head_spec,
-                diff_json=diff_json
+            {"role":"user","content": PROMPT_USER_TPL.safe_substitute(
+                base_spec=base_spec, head_spec=head_spec, diff_json=diff_json
             )}
         ],
         "temperature": 0.0
@@ -214,18 +214,17 @@ def call_openai_for_plan(base_spec, head_spec, diff_json):
     print("[agent] Calling LLM for security test plan...")
     data = post_json(url, payload, headers=headers)
 
-    # Try to extract JSON payload (the model is instructed to return a single JSON object)
-    text = None
+    # Extract text robustly across response variants
+    text = ""
     try:
         text = data["output"][0]["content"][0]["text"]
     except Exception:
-        # fallback older fields
         text = data.get("output_text") or data.get("content") or ""
 
     try:
         plan = json.loads(text)
-    except Exception as e:
-        print("[agent] Failed to parse LLM JSON. Raw:", text[:600], file=sys.stderr)
+    except Exception:
+        print("[agent] Failed to parse LLM JSON. Raw (first 600 chars):", text[:600], file=sys.stderr)
         raise
 
     if "items" not in plan or not isinstance(plan["items"], list):
@@ -279,12 +278,12 @@ def main():
     save_json("generated-security-test.postman_collection.json", collection)
     print("[agent] Generated Postman collection at generated-security-test.postman_collection.json")
 
-    # 3) Upsert via MCP
+    # 3) Upsert via MCP (non-fatal if it fails)
     try:
         _ = push_collection_via_mcp(collection, args.collection)
     except Exception as e:
-        print("[agent] MCP push error:", str(e), file=sys.stderr)
-        # Non-fatal: we still want local run.json in CI
+        print("[agent] MCP push error (non-fatal):", str(e), file=sys.stderr)
+
     print("[agent] Done.")
 
 if __name__ == "__main__":
