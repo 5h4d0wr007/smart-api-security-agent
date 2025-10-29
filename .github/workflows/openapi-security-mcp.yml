@@ -133,7 +133,7 @@ jobs:
 
       - name: Convert Postman report → SARIF
         run: |
-          python tools/cli_report_to_sarif.py run.json sarif.json
+          python tools/postman_json_to_sarif.py artifacts/run.json artifacts/sarif.json
 
       # === Sticky PR comment + Job Summary (reliable failure detection) ===
       - name: Build PR summary markdown
