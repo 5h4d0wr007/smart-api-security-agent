@@ -133,86 +133,120 @@ jobs:
 
       - name: Convert Postman report → SARIF
         run: |
-          python tools/postman_json_to_sarif.py run.json sarif.json
+          python tools/postman_json_to_sarif.py artifacts/run.json artifacts/sarif.json
 
-      # === Sticky PR comment + Job Summary (reliable failure detection) ===
+      # === Sticky PR comment + Job Summary (endpoint-grouped, all results) ===
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
           node <<'NODE'
           const fs = require('fs');
 
-          const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
-          const severityFrom = (t)=>{
-            const s=(t||'').toLowerCase();
-            if (s.includes('unauth')||s.includes('401')||s.includes('forbidden')||s.includes('role')||s.includes('403')) return 'error';
-            if (s.includes('invalid')||s.includes('400')||s.includes('conflict')||s.includes('409')||s.includes('bad request')) return 'warning';
-            return 'note';
+          const EMOJI = { passed: '✅', failed: '❌', skipped: '⏭️', unknown: '❔' };
+
+          const loadJSON = (p) => {
+            try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
+            catch { return null; }
           };
 
-          // Load SARIF
-          let sarif = null;
-          try { sarif = JSON.parse(fs.readFileSync('sarif.json','utf8')); } catch {}
-          const sarifResults = (((sarif?.runs||[])[0]||{}).results)||[];
-          const nonCleanSarif = sarifResults.filter(r => (r.ruleId||'') !== 'postman.security.cleanrun');
+          const run = loadJSON('run.json');
+          const sarif = loadJSON('sarif.json');
 
-          // Load Postman run.json
-          let runJson = null;
-          try { runJson = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
-
-          // Robust failure counts from either stats or failures array
-          let failedCount = 0;
-          if (runJson?.run?.stats?.assertions && Number.isFinite(runJson.run.stats.assertions.failed)) {
-            failedCount = Math.max(failedCount, Number(runJson.run.stats.assertions.failed)||0);
-          }
-          if (Array.isArray(runJson?.run?.failures)) {
-            failedCount = Math.max(failedCount, runJson.run.failures.length);
-          }
-
-          // Try to extract per-assertion messages when available
-          const rows = [];
-          if (Array.isArray(runJson?.run?.failures) && runJson.run.failures.length) {
-            for (const f of runJson.run.failures) {
-              const assertion = f.assertion || f.error?.test || f.error?.name || 'Assertion failed';
-              const msg = f.error?.message || '';
-              const itemName =
-                f.parent?.name ||
-                f.source?.name ||
-                f.cursor?.item?.name ||
-                'request';
-              const lvl = severityFrom(`${assertion} ${msg}`);
-              const category = (lvl==='error' ? 'Authorization/Authentication' : 'Validation');
-              rows.push({ level: lvl, message: `[${category}] ${itemName}: ${assertion}${msg ? ' — ' + msg : ''}` });
-            }
-          } else if (nonCleanSarif.length) {
-            for (const r of nonCleanSarif) {
-              rows.push({
-                level: r.level || 'note',
-                message: (r.message && r.message.text) || '(no message)'
-              });
-            }
-          } else if (failedCount > 0) {
-            // Stats-only fallback (no per-assertion detail available)
-            rows.push({
-              level: 'error',
-              message: `[Authorization/Authentication] Test suite: ${failedCount} assertion(s) failed — see run.json for details`
-            });
-          }
-
-          const total = rows.length;
           const lines = [];
-          lines.push('**Postman Security Test Agent — Findings**');
+          lines.push('**Postman Security Test Agent — Findings (Grouped by Endpoint)**');
           lines.push('');
-          lines.push(`Detected **${total}** finding${total===1?'':'s'}.`);
-          if (total === 0) {
+
+          if (run?.run?.executions?.length) {
+            const groups = new Map(); // key: "METHOD /path", value: rows
+            let totalTests = 0, passed = 0, failed = 0, skipped = 0;
+
+            for (const ex of run.run.executions) {
+              const req = ex.requestExecuted || {};
+              const resp = ex.response || {};
+              const method = (req.method || '').toUpperCase();
+              const path = '/' + (req.url?.path || []).join('/');
+              const endpoint = `${method} ${path}`;
+
+              // scenario from "(owner) POST /x"
+              let scenario = 'scenario';
+              const name = req.name || '';
+              const m = name.match(/^\(([^)]+)\)\s+[A-Z]+\s+.+$/);
+              if (m) scenario = m[1];
+
+              const tests = Array.isArray(ex.tests) ? ex.tests : [];
+              if (tests.length === 0) {
+                if (!groups.has(endpoint)) groups.set(endpoint, []);
+                groups.get(endpoint).push({
+                  scenario,
+                  test: 'No tests defined',
+                  status: 'unknown',
+                  code: resp.code,
+                  details: ''
+                });
+                continue;
+              }
+
+              for (const t of tests) {
+                const status = (t.status || 'unknown').toLowerCase();
+                const isPass = status === 'passed';
+                const isFail = status === 'failed';
+                passed += isPass ? 1 : 0;
+                failed += isFail ? 1 : 0;
+                skipped += status === 'skipped' ? 1 : 0;
+                totalTests += 1;
+
+                const details = t.error?.message ? t.error.message : '';
+                if (!groups.has(endpoint)) groups.set(endpoint, []);
+                groups.get(endpoint).push({
+                  scenario,
+                  test: t.name || '(unnamed test)',
+                  status,
+                  code: resp.code,
+                  details
+                });
+              }
+            }
+
+            const endpointCount = groups.size;
+            lines.push(`Ran **${totalTests}** test${totalTests===1?'':'s'} across **${endpointCount}** endpoint${endpointCount===1?'':'s'} — ${EMOJI.passed} ${passed} passed · ${EMOJI.failed} ${failed} failed${skipped?` · ${EMOJI.skipped} ${skipped} skipped`:''}.`);
             lines.push('');
-            lines.push('> ✅ No security test failures detected');
+
+            for (const [endpoint, rows] of groups) {
+              lines.push(`### \`${endpoint}\``);
+              lines.push('');
+              lines.push('| Scenario | Test | Result | Details |');
+              lines.push('|---|---|---|---|');
+
+              for (const r of rows) {
+                const icon = EMOJI[r.status] || EMOJI.unknown;
+                const resultText =
+                  r.status === 'passed' ? 'passed' :
+                  r.status === 'failed' ? `failed [HTTP ${r.code ?? '—'}]` :
+                  r.status === 'skipped' ? 'skipped' : 'unknown';
+                const details = r.details ? r.details.replace(/\n/g, ' ') : '';
+                lines.push(`| \`${r.scenario}\` | ${r.test} | ${icon} ${resultText} | ${details || ''} |`);
+              }
+              lines.push('');
+            }
+
           } else {
+            // Fallback to SARIF only if run.json missing
+            const results = (((sarif?.runs||[])[0]||{}).results)||[];
+            lines.push('_run.json not found; showing SARIF summary instead._');
             lines.push('');
-            lines.push('|  | Severity | Finding |');
-            lines.push('|---|---|---|');
-            for (const r of rows) lines.push(`| ${emoji(r.level)} | ${r.level} | ${r.message} |`);
+            if (results.length === 0) {
+              lines.push('> ✅ No security test failures detected');
+            } else {
+              const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
+              lines.push('|  | Severity | Finding |');
+              lines.push('|---|---|---|');
+              for (const r of results) {
+                const lvl = (r.level || 'note').toLowerCase();
+                lines.push(`| ${emoji(lvl)} | ${lvl} | ${(r.message && r.message.text) || '(no message)'} |`);
+              }
+            }
           }
+
           lines.push('');
           lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
           fs.writeFileSync('sarif_summary.md', lines.join('\n'));
