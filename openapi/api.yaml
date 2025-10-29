@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Mock Security API
-  version: 1.0.0
+  version: 1.1.0
 servers:
   - url: http://127.0.0.1:8000
 paths:
@@ -17,3 +17,65 @@ paths:
         '200': { description: OK }
         '401': { description: Unauthenticated }
         '404': { description: Not Found }
+    patch:
+      summary: Update user profile
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email: { type: string }
+                name: { type: string }
+      responses:
+        '200': { description: Updated }
+        '401': { description: Unauthenticated }
+        '404': { description: Not Found }
+  /accounts/{accountId}/transfer:
+    post:
+      summary: Transfer between accounts
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toAccountId, amount]
+              properties:
+                toAccountId: { type: string }
+                amount: { type: number }
+      responses:
+        '202': { description: Accepted }
+        '400': { description: Bad request }
+        '401': { description: Unauthenticated }
+        '404': { description: Not Found }
+  /orders/{orderId}/cancel:
+    post:
+      summary: Cancel an order
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Cancelled }
+        '401': { description: Unauthenticated }
+        '404': { description: Not Found }
+  /admin/reports:
+    get:
+      summary: Admin-only report
+      responses:
+        '200': { description: OK }
+        '401': { description: Unauthenticated }
+        '403': { description: Forbidden }
