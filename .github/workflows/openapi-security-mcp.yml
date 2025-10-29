@@ -75,22 +75,24 @@ jobs:
         run: |
           set -euo pipefail
           OASDIFF_VERSION="v1.10.28"
-          # x64 runner on GitHub Actions
-          TARBALL="oasdiff_${OASDIFF_VERSION#v}_Linux_x86_64.tar.gz"
-          for U in \
-            "https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}" \
-            "https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"; do
-            if curl -fL "$U" -o oasdiff.tgz; then break; fi
-          done
-          tar -xzf oasdiff.tgz oasdiff
+          # x64 runner on GitHub Actions (name in release asset is linux_amd64)
+          TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
+          URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          echo "Downloading oasdiff ${OASDIFF_VERSION}…"
+          if ! curl -fL "$URL_PRIMARY" -o oasdiff.tgz; then
+            echo "Primary URL failed, trying fallback…"
+            curl -fL "$URL_FALLBACK" -o oasdiff.tgz
+          fi
+          tar -xzf oasdiff.tgz
+          chmod +x oasdiff
           sudo mv oasdiff /usr/local/bin/oasdiff
-          sudo chmod +x /usr/local/bin/oasdiff
-          oasdiff --help >/dev/null
 
       - name: Start sample app (localhost:8000)
         run: |
           python app/app.py &
           echo $! > app.pid
+          # Warm up; just need the server responding
           for i in {1..20}; do
             if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
               echo "App is up"; break
@@ -146,11 +148,8 @@ jobs:
             --reporters cli,json \
             --reporter-json-export run.json \
           || true
-          # ensure run.json exists even if Postman bailed early
-          if [ ! -f run.json ]; then
-            echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
-          fi
-          ls -l run.json
+          # ensure run.json exists so the next step never crashes
+          [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
 
       - name: Convert Postman report → SARIF
         if: steps.gates.outputs.has_secrets == 'true'
@@ -162,7 +161,7 @@ d=json.load(open('sarif.json'))
 print("SARIF results:", len(d.get("runs",[{}])[0].get("results",[])))
 PY
 
-      # ------- ONLY CHANGE: replace brittle `node -e` with Python heredoc -------
+      # ----- SINGLE CHANGE: replace brittle node -e with safe Python heredoc -----
       - name: Build PR comment (markdown) from SARIF
         if: github.event_name == 'pull_request'
         run: |
@@ -177,24 +176,20 @@ def row(msg, level):
 lines = []
 lines.append("**Postman Security Test Agent — Findings**")
 if not results:
-    lines.append("")
-    lines.append("> ✅ No security test failures detected")
+    lines += ["", "> ✅ No security test failures detected"]
 else:
-    lines.append("")
-    lines.append("|  | Severity | Finding |")
-    lines.append("|---|---|---|")
+    lines += ["", "|  | Severity | Finding |", "|---|---|---|"]
     for r in results:
-        msg = (r.get("message",{}) or {}).get("text","(no message)")
+        msg = (r.get("message") or {}).get("text","(no message)")
         level = r.get("level","note")
         lines.append(row(msg, level))
-    lines.append("")
-    lines.append("_Artifacts: `run.json`, `sarif.json`, `diff.json`, `plan.json`, and the generated collection are attached to this run._")
+    lines += ["", "_Artifacts: `run.json`, `sarif.json`, `diff.json`, `plan.json`, and the generated collection are attached to this run._"]
 pathlib.Path('sarif_summary.md').write_text("\n".join(lines))
 PY
 
       - name: Post sticky PR comment
         if: github.event_name == 'pull_request'
-        uses: marocchino/sticky-pull-request-comment@v3
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: Postman Security Summary
           path: sarif_summary.md
@@ -224,10 +219,11 @@ import json, pathlib
 d=json.load(open('sarif.json'))
 res=d.get('runs',[{}])[0].get('results',[])
 lines=["**Postman Security Test Agent Findings**"]
-if not res: lines.append("- ✅ No security test failures detected")
+if not res:
+    lines.append("- ✅ No security test failures detected")
 else:
-  for r in res[:50]:
-    lines.append(f"- ❗ {(r.get('message') or {}).get('text','(no message)')}")
+    for r in res[:50]:
+        lines.append(f"- ❗ {(r.get('message') or {}).get('text','(no message)')}")
 pathlib.Path('sarif_summary.md').write_text("\n".join(lines))
 PY
       - uses: marocchino/sticky-pull-request-comment@v3
