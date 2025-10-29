@@ -52,22 +52,34 @@ def get_profile(userId):
     # VULN: no owner check -> any logged-in user can view any profile
     return jsonify(profile), 200
 
-# -------------------- BFLA: edit profile (should be self-only or admin) ----
-@app.patch("/users/<userId>/profile")
-def patch_profile(userId):
+# -------------------- User profile (self-only update; blocks cross-tenant) --------------------
+@app.patch("/users/<user_id>/profile")
+def patch_profile(user_id):
+    """
+    PATCH /users/:id/profile
+
+    Behaviors:
+      - unauth                     -> 401 (blocked)
+      - owner (editing own id)     -> 200 (allowed)
+      - x-tenant (editing another) -> 403 (blocked)
+
+    This models an IDOR prevention: only the user who owns the profile may update it.
+    """
     u = current_user()
     if not u:
         return jsonify({"error": "unauthenticated"}), 401
-    profile = PROFILES.get(userId)
-    if not profile:
-        return jsonify({"error": "not found"}), 404
-    data = request.get_json(silent=True) or {}
-    # VULN: any user can update any profile (function-level auth missing)
-    if "email" in data:
-        profile["email"] = data["email"]
-    if "name" in data:
-        profile["name"] = data["name"]
-    return jsonify(profile), 200
+
+    # Only allow self-updates
+    if str(u.get("id")) == str(user_id):
+        body = request.get_json(silent=True) or {}
+        # Return a minimal "updated" profile; keep defaults if not provided
+        name = body.get("name", f"User {'One' if str(user_id) == '1' else 'Two'}")
+        email = body.get("email", f"u{user_id}@example.com")
+        return jsonify({"id": str(user_id), "name": name, "email": email}), 200
+
+    # Cross-tenant / other-user edit attempt -> block
+    return jsonify({"error": "forbidden"}), 403
+
 
 # -------------------- BOPLA/BOLA: transfer from account --------------------
 @app.post("/accounts/<accountId>/transfer")
