@@ -129,125 +129,130 @@ jobs:
             --reporter-json-export run.json \
           || true
           # ensure run.json exists so the next step never crashes
-          [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+          [ -f run.json ] || echo '{"run":{"executions":[],"summary":{"tests":{"executed":0,"failed":0,"passed":0}}}}' > run.json
 
       - name: Convert Postman report → SARIF
         run: |
-          # FIX: read from root run.json, write to root sarif.json
           python tools/postman_json_to_sarif.py run.json sarif.json
 
-      # === Sticky PR comment + Job Summary (endpoint-grouped, all results) ===
+      # === Sticky PR comment + Job Summary (actionable endpoint grouping) ===
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
           node <<'NODE'
           const fs = require('fs');
 
-          const EMOJI = { passed: '✅', failed: '❌', skipped: '⏭️', unknown: '❔' };
+          const ok = '✅';
+          const fail = '❌';
+          const info = 'ℹ️';
 
-          const loadJSON = (p) => {
-            try { return JSON.parse(fs.readFileSync(p, 'utf8')); }
-            catch { return null; }
+          const asText = (x) => (typeof x === 'string' ? x : JSON.stringify(x));
+
+          // ---- load run.json ----
+          let run = null;
+          try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
+          const execs = run?.run?.executions || [];
+          const totalTests = run?.run?.summary?.tests?.executed ?? execs.length;
+          // We will synthesize our own pass/fail counts per execution
+          let passCount = 0, failCount = 0;
+
+          // Helper: parse "(scenario) METHOD /path" from request name
+          const parseName = (name='') => {
+            // e.g. "(x-tenant) POST /orders/202/cancel"
+            const m = name.match(/^\(([^)]+)\)\s+([A-Z]+)\s+(.+)$/);
+            if (!m) return { scenario:'', method:'', path:name.trim() };
+            return { scenario: m[1], method: m[2], path: m[3] };
           };
 
-          const run = loadJSON('run.json');
-          const sarif = loadJSON('sarif.json');
+          // Expectation & interpretation for each scenario
+          const evaluate = ({scenario, method, path, code}) => {
+            let expected, passed, why;
 
-          const lines = [];
-          lines.push('**Postman Security Test Agent — Findings (Grouped by Endpoint)**');
-          lines.push('');
-
-          if (run?.run?.executions?.length) {
-            const groups = new Map(); // key: "METHOD /path", value: rows
-            let totalTests = 0, passed = 0, failed = 0, skipped = 0;
-
-            for (const ex of run.run.executions) {
-              const req = ex.requestExecuted || {};
-              const resp = ex.response || {};
-              const method = (req.method || '').toUpperCase();
-              const path = '/' + (req.url?.path || []).join('/');
-              const endpoint = `${method} ${path}`;
-
-              // scenario from "(owner) POST /x"
-              let scenario = 'scenario';
-              const name = req.name || '';
-              const m = name.match(/^\(([^)]+)\)\s+[A-Z]+\s+.+$/);
-              if (m) scenario = m[1];
-
-              const tests = Array.isArray(ex.tests) ? ex.tests : [];
-              if (tests.length === 0) {
-                if (!groups.has(endpoint)) groups.set(endpoint, []);
-                groups.get(endpoint).push({
-                  scenario,
-                  test: 'No tests defined',
-                  status: 'unknown',
-                  code: resp.code,
-                  details: ''
-                });
-                continue;
+            if (scenario === 'unauth') {
+              expected = '401 (blocked)';
+              passed = (code === 401);
+              why = passed
+                ? 'Unauthenticated access is correctly rejected. Not a vulnerability.'
+                : 'Unauthenticated request was not blocked — potential Broken Authentication/IDOR.';
+            } else if (scenario === 'x-tenant') {
+              expected = 'blocked (403 or 404)';
+              passed = (code === 403 || code === 404);
+              why = passed
+                ? 'Cross-tenant access is blocked (either hidden as 404 or denied as 403).'
+                : 'Cross-tenant access not blocked — likely IDOR or missing tenant scoping.';
+            } else if (scenario === 'owner') {
+              // Non-admin "owner" token is a normal user. For /admin/** endpoints, expect a block.
+              const isAdminRoute = path.startsWith('/admin/');
+              if (isAdminRoute) {
+                expected = '403 (non-admin should be blocked)';
+                passed = (code === 403);
+                why = passed
+                  ? 'Non-admin user is correctly blocked from admin endpoint.'
+                  : 'Non-admin user could not access admin route as expected — check why it returned ' + code + ' instead of 403.';
+              } else {
+                expected = '200 (happy path)';
+                passed = (code === 200);
+                why = passed
+                  ? 'Authorized owner can perform their operation successfully.'
+                  : (code === 400
+                      ? 'Request failed validation (400). Check test body/params or server validation rules.'
+                      : 'Authorized user was blocked — verify auth scope/permissions and route handling.');
               }
-
-              for (const t of tests) {
-                const status = (t.status || 'unknown').toLowerCase();
-                const isPass = status === 'passed';
-                const isFail = status === 'failed';
-                passed += isPass ? 1 : 0;
-                failed += isFail ? 1 : 0;
-                skipped += status === 'skipped' ? 1 : 0;
-                totalTests += 1;
-
-                const details = t.error?.message ? t.error.message : '';
-                if (!groups.has(endpoint)) groups.set(endpoint, []);
-                groups.get(endpoint).push({
-                  scenario,
-                  test: t.name || '(unnamed test)',
-                  status,
-                  code: resp.code,
-                  details
-                });
-              }
-            }
-
-            const endpointCount = groups.size;
-            lines.push(`Ran **${totalTests}** test${totalTests===1?'':'s'} across **${endpointCount}** endpoint${endpointCount===1?'':'s'} — ${EMOJI.passed} ${passed} passed · ${EMOJI.failed} ${failed} failed${skipped?` · ${EMOJI.skipped} ${skipped} skipped`:''}.`);
-            lines.push('');
-
-            for (const [endpoint, rows] of groups) {
-              lines.push(`### \`${endpoint}\``);
-              lines.push('');
-              lines.push('| Scenario | Test | Result | Details |');
-              lines.push('|---|---|---|---|');
-
-              for (const r of rows) {
-                const icon = EMOJI[r.status] || EMOJI.unknown;
-                const resultText =
-                  r.status === 'passed' ? 'passed' :
-                  r.status === 'failed' ? `failed [HTTP ${r.code ?? '—'}]` :
-                  r.status === 'skipped' ? 'skipped' : 'unknown';
-                const details = r.details ? r.details.replace(/\n/g, ' ') : '';
-                lines.push(`| \`${r.scenario}\` | ${r.test} | ${icon} ${resultText} | ${details || ''} |`);
-              }
-              lines.push('');
-            }
-
-          } else {
-            // Fallback to SARIF only if run.json missing
-            const results = (((sarif?.runs||[])[0]||{}).results)||[];
-            lines.push('_run.json not found; showing SARIF summary instead._');
-            lines.push('');
-            if (results.length === 0) {
-              lines.push('> ✅ No security test failures detected');
             } else {
-              const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
-              lines.push('|  | Severity | Finding |');
-              lines.push('|---|---|---|');
-              for (const r of results) {
-                const lvl = (r.level || 'note').toLowerCase();
-                lines.push(`| ${emoji(lvl)} | ${lvl} | ${(r.message && r.message.text) || '(no message)'} |`);
-              }
+              expected = '—';
+              passed = false;
+              why = 'Unknown scenario label; adjust generator naming.';
             }
+
+            return { expected, passed, why };
+          };
+
+          // Group by endpoint (METHOD + path)
+          const groups = new Map(); // key -> {rows:[]}
+          for (const e of execs) {
+            const { scenario, method, path } = parseName(e?.requestExecuted?.name || '');
+            const code = e?.response?.code;
+            const key = `${method} ${path}`;
+            const { expected, passed, why } = evaluate({scenario, method, path, code});
+            const row = {
+              scenario, test: expected, result: `${passed ? ok+' passed' : fail+' failed'} [HTTP ${code}]`,
+              details: (passed ? 'met expectation' : `expected ${expected.split(' ')[0]} got ${code}`),
+              why
+            };
+            if (!groups.has(key)) groups.set(key, { rows: [] });
+            groups.get(key).rows.push(row);
+            if (passed) passCount++; else failCount++;
           }
 
+          // Build markdown
+          const lines = [];
+          lines.push('**Postman Security Test Agent — Findings (Grouped by Endpoint, Actionable)**');
+          lines.push('');
+          lines.push(`Ran ${totalTests} test${totalTests===1?'':'s'} across ${groups.size} endpoints — ${ok} ${passCount} passed · ${fail} ${failCount} failed.`);
+          lines.push('');
+
+          const renderTable = (rows) => {
+            const hdr = '| Scenario | Check | Result | Details | Why it matters |';
+            const sep = '|---|---|---|---|---|';
+            const body = rows.map(r => `| \`${r.scenario}\` | ${r.test} | ${r.result} | ${r.details} | ${r.why} |`);
+            return [hdr, sep, ...body].join('\n');
+          };
+
+          for (const [endpoint, data] of groups) {
+            lines.push('');
+            lines.push(`#### \`${endpoint}\``);
+            lines.push('');
+            // Sort scenarios: unauth, owner, x-tenant
+            const order = { 'unauth': 1, 'owner': 2, 'x-tenant': 3 };
+            const sorted = [...data.rows].sort((a,b)=>(order[a.scenario]||9)-(order[b.scenario]||9));
+            // If both x-tenant 403/404 atomic tests existed, our synthesized row already reflects combined logic.
+            lines.push(renderTable(sorted));
+          }
+
+          lines.push('');
+          lines.push('_Legend:_' );
+          lines.push(`- \`${ok} passed\` — behavior matches security expectation.`);
+          lines.push(`- \`${fail} failed\` — investigate. For owner=400, check request body/params; for owner/x-tenant returning 2xx, check authorization/tenant checks.`);
           lines.push('');
           lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
           fs.writeFileSync('sarif_summary.md', lines.join('\n'));
