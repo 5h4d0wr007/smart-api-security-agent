@@ -135,108 +135,68 @@ jobs:
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # === Sticky PR comment + Job Summary (robust + count fallback) ===
+      # === Sticky PR comment + Job Summary (reliable failure detection) ===
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
           node <<'NODE'
           const fs = require('fs');
 
-          function severityFrom(text) {
-            const s = (text||'').toLowerCase();
-            if (s.includes('unauth') || s.includes('401') || s.includes('forbidden') || s.includes('role') || s.includes('403')) return 'error';
-            if (s.includes('invalid') || s.includes('400') || s.includes('conflict') || s.includes('409') || s.includes('bad request')) return 'warning';
-            return 'note';
-          }
           const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
+          const severityFrom = (t)=>{
+            const s=(t||'').toLowerCase();
+            if (s.includes('unauth')||s.includes('401')||s.includes('forbidden')||s.includes('role')||s.includes('403')) return 'error';
+            if (s.includes('invalid')||s.includes('400')||s.includes('conflict')||s.includes('409')||s.includes('bad request')) return 'warning';
+            return 'note';
+          };
 
-          let sarifResults = [];
-          try {
-            const s = JSON.parse(fs.readFileSync('sarif.json','utf8'));
-            sarifResults = (((s.runs||[{}])[0]||{}).results)||[];
-          } catch {}
-
-          let run;
-          try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
-
-          function deepScanFailures(node, out=[]) {
-            if (!node) return out;
-            if (Array.isArray(node)) { for (const v of node) deepScanFailures(v, out); return out; }
-            if (typeof node === 'object') {
-              if (Array.isArray(node.failures) && node.failures.length) {
-                for (const f of node.failures) {
-                  const itemName =
-                    (f.parent && f.parent.name) ||
-                    (f.source && (f.source.name || (f.source.request && f.source.request.name))) ||
-                    (f.cursor && f.cursor.item && (f.cursor.item.name || f.cursor.item.id)) ||
-                    (node.item && node.item.name) || 'request';
-                  const testName =
-                    (f.error && (f.error.test || f.error.name)) ||
-                    f.assertion || 'Assertion failed';
-                  const detail =
-                    (f.error && (f.error.message || (f.error.actual!==undefined && f.error.expected!==undefined && `${f.error.actual} vs ${f.error.expected}`))) || '';
-                  const lvl = severityFrom(`${testName} ${detail}`);
-                  const category = (lvl === 'error' ? 'Authorization/Authentication' : 'Validation');
-                  out.push({ level: lvl, message: `[${category}] ${itemName}: ${testName}${detail ? ' — ' + detail : ''}` });
-                }
-              }
-              if (Array.isArray(node.executions)) {
-                for (const ex of node.executions) {
-                  const itemName =
-                    (ex.item && ex.item.name) ||
-                    (ex.request && ex.request.name) ||
-                    ex.itemName || 'request';
-                  const assertions = Array.isArray(ex.assertions) ? ex.assertions : [];
-                  for (const a of assertions) {
-                    const err = a.error || null;
-                    if (!err) continue;
-                    const testName = a.assertion || a.name || err.name || 'Security test failed';
-                    const detail = err.message || '';
-                    const lvl = severityFrom(`${testName} ${detail}`);
-                    const category = (lvl === 'error' ? 'Authorization/Authentication' : 'Validation');
-                    out.push({ level: lvl, message: `[${category}] ${itemName}: ${testName}${detail ? ' — ' + detail : ''}` });
-                  }
-                }
-              }
-              for (const k of Object.keys(node)) deepScanFailures(node[k], out);
-            }
-            return out;
-          }
-
-          // Count failures even if details are missing (stats-only fallback)
-          function countFailedAssertions(node) {
-            let n = 0;
-            if (!node) return 0;
-            if (Array.isArray(node)) return node.reduce((a,v)=>a+countFailedAssertions(v),0);
-            if (typeof node === 'object') {
-              // classic stats shape: { assertions: { total, failed } }
-              if (node.assertions && typeof node.assertions === 'object' && Number.isFinite(node.assertions.failed)) {
-                n += Number(node.assertions.failed)||0;
-              }
-              for (const k of Object.keys(node)) n += countFailedAssertions(node[k]);
-            }
-            return n;
-          }
-
-          const failureRows = deepScanFailures(run);
-          const failedCount = countFailedAssertions(run);
-
-          let rows = failureRows;
+          // Load SARIF
+          let sarif = null;
+          try { sarif = JSON.parse(fs.readFileSync('sarif.json','utf8')); } catch {}
+          const sarifResults = (((sarif?.runs||[])[0]||{}).results)||[];
           const nonCleanSarif = sarifResults.filter(r => (r.ruleId||'') !== 'postman.security.cleanrun');
 
-          if (rows.length === 0 && nonCleanSarif.length > 0) {
-            rows = nonCleanSarif.map(r => ({
-              level: r.level || 'note',
-              message: (r.message && r.message.text) || '(no message)'
-            }));
+          // Load Postman run.json
+          let runJson = null;
+          try { runJson = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
+
+          // Robust failure counts from either stats or failures array
+          let failedCount = 0;
+          if (runJson?.run?.stats?.assertions && Number.isFinite(runJson.run.stats.assertions.failed)) {
+            failedCount = Math.max(failedCount, Number(runJson.run.stats.assertions.failed)||0);
+          }
+          if (Array.isArray(runJson?.run?.failures)) {
+            failedCount = Math.max(failedCount, runJson.run.failures.length);
           }
 
-          // Final fallback: show a synthetic finding if stats report failures
-          if (rows.length === 0 && failedCount > 0) {
-            rows = [{
+          // Try to extract per-assertion messages when available
+          const rows = [];
+          if (Array.isArray(runJson?.run?.failures) && runJson.run.failures.length) {
+            for (const f of runJson.run.failures) {
+              const assertion = f.assertion || f.error?.test || f.error?.name || 'Assertion failed';
+              const msg = f.error?.message || '';
+              const itemName =
+                f.parent?.name ||
+                f.source?.name ||
+                f.cursor?.item?.name ||
+                'request';
+              const lvl = severityFrom(`${assertion} ${msg}`);
+              const category = (lvl==='error' ? 'Authorization/Authentication' : 'Validation');
+              rows.push({ level: lvl, message: `[${category}] ${itemName}: ${assertion}${msg ? ' — ' + msg : ''}` });
+            }
+          } else if (nonCleanSarif.length) {
+            for (const r of nonCleanSarif) {
+              rows.push({
+                level: r.level || 'note',
+                message: (r.message && r.message.text) || '(no message)'
+              });
+            }
+          } else if (failedCount > 0) {
+            // Stats-only fallback (no per-assertion detail available)
+            rows.push({
               level: 'error',
               message: `[Authorization/Authentication] Test suite: ${failedCount} assertion(s) failed — see run.json for details`
-            }];
+            });
           }
 
           const total = rows.length;
