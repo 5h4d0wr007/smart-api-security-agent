@@ -135,7 +135,7 @@ jobs:
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # === Sticky PR comment + Job Summary (heredoc; also reads run.json) ===
+      # === Sticky PR comment + Job Summary (NOW reads run.run.failures first) ===
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
@@ -150,22 +150,41 @@ jobs:
           }
           const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
 
-          // Load SARIF (preferred if it has real findings)
+          // Prefer SARIF only if it contains non-placeholder results
           let sarifResults = [];
           try {
             const s = JSON.parse(fs.readFileSync('sarif.json','utf8'));
             sarifResults = (((s.runs||[{}])[0]||{}).results)||[];
-          } catch(e){ sarifResults = []; }
+          } catch(e){}
 
-          // Load raw Postman run.json as fallback/augment
           let run = null;
-          try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch(e){ run = null; }
+          try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch(e){}
 
-          function collectFromRun(r) {
+          function rowsFromFailures(r) {
+            const fails = (r && r.run && Array.isArray(r.run.failures)) ? r.run.failures : [];
             const out = [];
-            if (!r) return out;
-            const runObj = r.run || {};
-            const executions = Array.isArray(runObj.executions) ? runObj.executions : [];
+            for (const f of fails) {
+              const itemName =
+                (f.parent && f.parent.name) ||
+                (f.source && f.source.name) ||
+                (f.cursor && f.cursor.item && f.cursor.item.name) ||
+                'request';
+              const testName = (f.error && (f.error.test || f.error.name)) || 'Assertion failed';
+              const detail = (f.error && f.error.message) || '';
+              const lvl = severityFrom(`${testName} ${detail}`);
+              const category = (lvl==='error' ? 'Authorization/Authentication' : 'Validation');
+              out.push({
+                level: lvl,
+                message: `[${category}] ${itemName}: ${testName}${detail ? ' — ' + detail : ''}`
+              });
+            }
+            return out;
+          }
+
+          function rowsFromExecutions(r) {
+            const out = [];
+            if (!r || !r.run) return out;
+            const executions = Array.isArray(r.run.executions) ? r.run.executions : [];
             for (const ex of executions) {
               const itemName =
                 (((ex.item||{}).name) ||
@@ -184,16 +203,17 @@ jobs:
             return out;
           }
 
-          // Prefer SARIF if it has any non-cleanrun results
           const nonCleanSarif = sarifResults.filter(r => (r.ruleId||'') !== 'postman.security.cleanrun');
+
+          // Priority: run.failures → run.executions.assertions → SARIF
           let rows = [];
-          if (nonCleanSarif.length > 0) {
+          rows = rowsFromFailures(run);
+          if (rows.length === 0) rows = rowsFromExecutions(run);
+          if (rows.length === 0 && nonCleanSarif.length > 0) {
             rows = nonCleanSarif.map(r => ({
               level: r.level||'note',
               message: (r.message && r.message.text) || '(no message)'
             }));
-          } else {
-            rows = collectFromRun(run);
           }
 
           const total = rows.length;
