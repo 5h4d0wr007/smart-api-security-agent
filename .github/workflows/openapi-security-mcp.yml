@@ -11,15 +11,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  actions: read
   contents: read
-  pull-requests: write
+  actions: read
   security-events: write
-  metadata: read
+  pull-requests: write
 
 env:
-  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}
-  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}
+  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Smart API Security Agent
   POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
   POSTMAN_CLI_DISABLE_TELEMETRY: "true"
 
@@ -38,7 +37,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Setup Node
+      - name: Setup Node (for swagger-cli)
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -49,16 +48,14 @@ jobs:
           pip install -r app/requirements.txt
           pip install openai requests
 
-      - name: Install Postman CLI and swagger-cli
+      - name: Install CLI tooling (Postman CLI + swagger-cli)
         run: |
-          # Postman CLI (official)
-          curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
-          # OpenAPI validator
+          curl -fsSL "https://dl-cli.pstmn.io/install/linux64.sh" | sh
           npm i -g @apidevtools/swagger-cli@4
           postman --version
           swagger-cli --version
 
-      - name: Install oasdiff (pinned)
+      - name: Install oasdiff (Linux binary, pinned)
         run: |
           set -euo pipefail
           OASDIFF_VERSION="v1.10.28"
@@ -78,11 +75,9 @@ jobs:
         run: |
           python app/app.py &
           echo $! > app.pid
-          # Warm up; just need the server responding
           for i in {1..20}; do
             if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
-              echo "App is up"
-              break
+              echo "App is up"; break
             fi
             sleep 1
           done
@@ -95,7 +90,6 @@ jobs:
           mkdir -p .tmp
           FILE=$(git diff --name-only "$BASE...$HEAD" | grep -E '^openapi/.*\.(ya?ml|json)$' | head -n1 || true)
           if [ -z "${FILE:-}" ]; then
-            echo "No OpenAPI changes detected."
             echo '{}' > diff.json
           else
             git show "$BASE:$FILE" > .tmp/base.yaml || cp openapi/api.v1.yaml .tmp/base.yaml
@@ -106,7 +100,7 @@ jobs:
           fi
           echo "Wrote diff.json"
 
-      - name: Generate Postman collection via MCP
+      - name: LLM → plan & create/overwrite collection via official Postman MCP
         env:
           OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
@@ -117,8 +111,9 @@ jobs:
             --diff diff.json \
             --collection "security test collection" \
             --plan plan.json
+          test -f generated-security-test.postman_collection.json
 
-      - name: Postman CLI login
+      - name: Postman CLI login (non-interactive)
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
@@ -127,50 +122,56 @@ jobs:
       - name: Run generated collection with Postman CLI (JSON reporter)
         continue-on-error: true
         run: |
+          set -euo pipefail
           postman collection run ./generated-security-test.postman_collection.json \
             --reporters cli,json \
             --reporter-json-export run.json \
           || true
-          # ensure run.json exists so the next step never crashes
-          [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+          # ensure run.json exists even if Postman bailed early
+          if [ ! -f run.json ]; then
+            echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+          fi
+          ls -l run.json
 
       - name: Convert Postman report → SARIF
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
+          python - <<'PY'
+import json
+d=json.load(open('sarif.json'))
+print("SARIF results:", len(d.get("runs",[{}])[0].get("results",[])))
+PY
 
-      # ----- THE ONLY CHANGE (safe Node heredoc instead of node -e "…") -----
-      - name: Build PR comment markdown from SARIF
+      # ---------- ONLY CHANGE: build PR comment with a Node heredoc ----------
+      - name: Build PR comment (markdown) from SARIF
+        if: github.event_name == 'pull_request'
         run: |
           node <<'NODE'
-          const fs = require('fs');
-          const s = JSON.parse(fs.readFileSync('sarif.json','utf8'));
-          const res = ((s.runs||[{}])[0].results)||[];
-          const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
-          const lines = [];
-          lines.push('**Postman Security Test Agent — Findings**');
-          lines.push('');
-          lines.push(`Detected **${res.length}** finding${res.length===1?'':'s'}.`);
+          const fs=require('fs');
+          const s=JSON.parse(fs.readFileSync('sarif.json','utf8'));
+          const res=((s.runs||[{}])[0].results)||[];
+          const emoji=(l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
+          const lines=[];
+          lines.push("**Postman Security Test Agent — Findings**");
+          lines.push("");
           if(res.length===0){
-            lines.push('');
-            lines.push('> ✅ No security test failures detected');
+            lines.push("> ✅ No security test failures detected");
           }else{
-            lines.push('');
-            lines.push('|  | Severity | Finding |');
-            lines.push('|---|---|---|');
+            lines.push("|  | Severity | Finding |");
+            lines.push("|---|---|---|");
             for(const r of res){
-              const lvl = r.level || 'note';
-              const raw = (r.message && r.message.text) || '(no message)';
-              // escape pipes so markdown table does not break
-              const msg = String(raw).replace(/\|/g,'\\|');
+              const lvl=r.level||'note';
+              const raw=(r.message&&r.message.text)||'(no message)';
+              const msg=String(raw).replace(/\|/g,'\\|');
               lines.push(`| ${emoji(lvl)} | ${lvl} | ${msg} |`);
             }
-            lines.push('');
-            lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
+            lines.push("");
+            lines.push("_Artifacts: `run.json`, `sarif.json`, `diff.json`, `plan.json`, and the generated collection are attached to this run._");
           }
           fs.writeFileSync('sarif_summary.md', lines.join('\n'));
           NODE
 
-      - name: Comment findings on PR
+      - name: Post sticky PR comment
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
@@ -182,10 +183,11 @@ jobs:
         with:
           sarif_file: sarif.json
           category: openapi-postman-security
-          ref: refs/heads/${{ github.head_ref }}
-          sha: ${{ github.event.pull_request.head.sha }}
+          commit_sha: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref:        ${{ format('refs/heads/{0}', github.head_ref || github.ref_name) }}
 
       - name: Upload artifacts (diff, plan, run, sarif, collection)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: api-security-output
