@@ -135,7 +135,7 @@ jobs:
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # === Sticky PR comment + Job Summary (robust, layout-agnostic parser) ===
+      # === Sticky PR comment + Job Summary (robust + count fallback) ===
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
@@ -159,38 +159,27 @@ jobs:
           let run;
           try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
 
-          // ---- Generic deep scanners (cover Postman CLI / Newman variants) ----
           function deepScanFailures(node, out=[]) {
             if (!node) return out;
-            if (Array.isArray(node)) {
-              for (const v of node) deepScanFailures(v, out);
-              return out;
-            }
+            if (Array.isArray(node)) { for (const v of node) deepScanFailures(v, out); return out; }
             if (typeof node === 'object') {
-              // If this object has a 'failures' array, harvest it
               if (Array.isArray(node.failures) && node.failures.length) {
                 for (const f of node.failures) {
                   const itemName =
                     (f.parent && f.parent.name) ||
                     (f.source && (f.source.name || (f.source.request && f.source.request.name))) ||
                     (f.cursor && f.cursor.item && (f.cursor.item.name || f.cursor.item.id)) ||
-                    (node.item && node.item.name) ||
-                    'request';
-
-                    const testName =
-                      (f.error && (f.error.test || f.error.name)) ||
-                      f.assertion ||
-                      'Assertion failed';
-
-                    const detail = (f.error && (f.error.message || f.error.showDiff && `${f.error.actual} vs ${f.error.expected}`)) || '';
-
-                    const lvl = severityFrom(`${testName} ${detail}`);
-                    const category = (lvl === 'error' ? 'Authorization/Authentication' : 'Validation');
-
-                    out.push({ level: lvl, message: `[${category}] ${itemName}: ${testName}${detail ? ' — ' + detail : ''}` });
+                    (node.item && node.item.name) || 'request';
+                  const testName =
+                    (f.error && (f.error.test || f.error.name)) ||
+                    f.assertion || 'Assertion failed';
+                  const detail =
+                    (f.error && (f.error.message || (f.error.actual!==undefined && f.error.expected!==undefined && `${f.error.actual} vs ${f.error.expected}`))) || '';
+                  const lvl = severityFrom(`${testName} ${detail}`);
+                  const category = (lvl === 'error' ? 'Authorization/Authentication' : 'Validation');
+                  out.push({ level: lvl, message: `[${category}] ${itemName}: ${testName}${detail ? ' — ' + detail : ''}` });
                 }
               }
-              // If this object has 'executions', look for assertions with errors
               if (Array.isArray(node.executions)) {
                 for (const ex of node.executions) {
                   const itemName =
@@ -209,22 +198,45 @@ jobs:
                   }
                 }
               }
-              // Recurse into all properties
               for (const k of Object.keys(node)) deepScanFailures(node[k], out);
             }
             return out;
           }
 
-          const failureRows = deepScanFailures(run);
+          // Count failures even if details are missing (stats-only fallback)
+          function countFailedAssertions(node) {
+            let n = 0;
+            if (!node) return 0;
+            if (Array.isArray(node)) return node.reduce((a,v)=>a+countFailedAssertions(v),0);
+            if (typeof node === 'object') {
+              // classic stats shape: { assertions: { total, failed } }
+              if (node.assertions && typeof node.assertions === 'object' && Number.isFinite(node.assertions.failed)) {
+                n += Number(node.assertions.failed)||0;
+              }
+              for (const k of Object.keys(node)) n += countFailedAssertions(node[k]);
+            }
+            return n;
+          }
 
-          // Fallback to SARIF only if we truly found nothing
+          const failureRows = deepScanFailures(run);
+          const failedCount = countFailedAssertions(run);
+
           let rows = failureRows;
           const nonCleanSarif = sarifResults.filter(r => (r.ruleId||'') !== 'postman.security.cleanrun');
+
           if (rows.length === 0 && nonCleanSarif.length > 0) {
             rows = nonCleanSarif.map(r => ({
               level: r.level || 'note',
               message: (r.message && r.message.text) || '(no message)'
             }));
+          }
+
+          // Final fallback: show a synthetic finding if stats report failures
+          if (rows.length === 0 && failedCount > 0) {
+            rows = [{
+              level: 'error',
+              message: `[Authorization/Authentication] Test suite: ${failedCount} assertion(s) failed — see run.json for details`
+            }];
           }
 
           const total = rows.length;
@@ -239,9 +251,7 @@ jobs:
             lines.push('');
             lines.push('|  | Severity | Finding |');
             lines.push('|---|---|---|');
-            for (const r of rows) {
-              lines.push(`| ${emoji(r.level)} | ${r.level} | ${r.message} |`);
-            }
+            for (const r of rows) lines.push(`| ${emoji(r.level)} | ${r.level} | ${r.message} |`);
           }
           lines.push('');
           lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
