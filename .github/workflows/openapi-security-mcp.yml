@@ -75,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           OASDIFF_VERSION="v1.10.28"
-          # x64 runner on GitHub Actions (name in release asset is linux_amd64)
+          # GitHub ubuntu-latest runner uses x86_64; asset name uses linux_amd64
           TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
           URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
           URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
@@ -149,7 +149,10 @@ jobs:
             --reporter-json-export run.json \
           || true
           # ensure run.json exists so the next step never crashes
-          [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+          if [ ! -f run.json ]; then
+            echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
+          fi
+          ls -l run.json
 
       - name: Convert Postman report → SARIF
         if: steps.gates.outputs.has_secrets == 'true'
@@ -161,31 +164,37 @@ d=json.load(open('sarif.json'))
 print("SARIF results:", len(d.get("runs",[{}])[0].get("results",[])))
 PY
 
-      # ----- SINGLE CHANGE: replace brittle node -e with safe Python heredoc -----
+      # (original brittle node step restored — this made the job run before)
       - name: Build PR comment (markdown) from SARIF
         if: github.event_name == 'pull_request'
         run: |
-          python - <<'PY'
-import json, pathlib
-sarif = json.load(open('sarif.json'))
-results = sarif.get('runs',[{}])[0].get('results',[])
-def esc(s): return str(s).replace('|','\\|')
-def row(msg, level):
-    sev = {"error":"❌","warning":"⚠️","note":"ℹ️"}.get(level,"❔")
-    return f"| {sev} | {level} | {esc(msg)} |"
-lines = []
-lines.append("**Postman Security Test Agent — Findings**")
-if not results:
-    lines += ["", "> ✅ No security test failures detected"]
-else:
-    lines += ["", "|  | Severity | Finding |", "|---|---|---|"]
-    for r in results:
-        msg = (r.get("message") or {}).get("text","(no message)")
-        level = r.get("level","note")
-        lines.append(row(msg, level))
-    lines += ["", "_Artifacts: `run.json`, `sarif.json`, `diff.json`, `plan.json`, and the generated collection are attached to this run._"]
-pathlib.Path('sarif_summary.md').write_text("\n".join(lines))
-PY
+          node -e "
+            const fs=require('fs');
+            const s=JSON.parse(fs.readFileSync('sarif.json','utf8'));
+            const res=((s.runs||[{}])[0].results)||[];
+            const total=res.length;
+            const emoji=(l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
+            const lines=[];
+            lines.push('**Postman Security Test Agent — Findings**');
+            lines.push('');
+            lines.push(`Detected **${total}** finding${total===1?'':'s'}.`);
+            if(total===0){
+              lines.push('');
+              lines.push('> ✅ No security test failures detected');
+            }else{
+              lines.push('');
+              lines.push('|  | Severity | Finding |');
+              lines.push('|---|---|---|');
+              for(const r of res){
+                const lvl=r.level||'note';
+                const msg=(r.message&&r.message.text)||'(no message)';
+                lines.push(`| ${emoji(lvl)} | ${lvl} | ${msg.replaceAll('|','\\|')} |`);
+              }
+            }
+            lines.push('');
+            lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
+            fs.writeFileSync('sarif_summary.md',lines.join('\\n'));
+          "
 
       - name: Post sticky PR comment
         if: github.event_name == 'pull_request'
@@ -219,11 +228,10 @@ import json, pathlib
 d=json.load(open('sarif.json'))
 res=d.get('runs',[{}])[0].get('results',[])
 lines=["**Postman Security Test Agent Findings**"]
-if not res:
-    lines.append("- ✅ No security test failures detected")
+if not res: lines.append("- ✅ No security test failures detected")
 else:
-    for r in res[:50]:
-        lines.append(f"- ❗ {(r.get('message') or {}).get('text','(no message)')}")
+  for r in res[:50]:
+    lines.append(f"- ❗ {(r.get('message') or {}).get('text','(no message)')}")
 pathlib.Path('sarif_summary.md').write_text("\n".join(lines))
 PY
       - uses: marocchino/sticky-pull-request-comment@v3
