@@ -73,22 +73,42 @@ def patch_profile(userId):
 @app.post("/accounts/<accountId>/transfer")
 def transfer(accountId):
     u = current_user()
-    if not u:
-        return jsonify({"error": "unauthenticated"}), 401
-    acc = ACCOUNTS.get(accountId)
-    if not acc:
-        return jsonify({"error": "not found"}), 404
     data = request.get_json(silent=True) or {}
     to_acc = data.get("toAccountId")
     amount = data.get("amount", 0)
+
+    # Always ensure the target exists
     if to_acc not in ACCOUNTS:
         return jsonify({"error": "invalid target"}), 400
-    # VULN: no ownership check -> any user can transfer from any account
-    if amount <= 0 or acc["balance"] < amount:
-        return jsonify({"error": "insufficient"}), 400
-    acc["balance"] -= amount
-    ACCOUNTS[to_acc]["balance"] += amount
-    return jsonify({"from": acc["id"], "to": to_acc, "amount": amount}), 202
+
+    # --- intentionally unsafe logic for testing scenarios ---
+    # 1. Unauthenticated users: should be blocked (expected 401), but we'll return 200 to simulate broken auth
+    if not u:
+        # intentionally vulnerable
+        return jsonify({
+            "note": "unauthenticated transfer allowed (intentional for testing)",
+            "from": accountId,
+            "to": to_acc,
+            "amount": amount
+        }), 200
+
+    # 2. Owner performing transfer: should work as expected (expected 200)
+    acc = ACCOUNTS.get(accountId)
+    if acc and acc["owner"] == u["id"]:
+        if amount <= 0 or acc["balance"] < amount:
+            return jsonify({"error": "insufficient"}), 400
+        acc["balance"] -= amount
+        ACCOUNTS[to_acc]["balance"] += amount
+        return jsonify({"from": acc["id"], "to": to_acc, "amount": amount}), 200
+
+    # 3. Cross-tenant transfer: should be blocked (expected 403/404) but return 200 to simulate IDOR
+    return jsonify({
+        "note": "cross-tenant transfer allowed (intentional IDOR)",
+        "from": accountId,
+        "to": to_acc,
+        "amount": amount
+    }), 200
+
 
 # -------------------- BFLA: cancel order (owner-only, but missing check) ----
 @app.post("/orders/<orderId>/cancel")
