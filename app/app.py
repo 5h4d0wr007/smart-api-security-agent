@@ -129,17 +129,16 @@ def transfer(accountId):
 
 
 
-# -------------------- BFLA: cancel order (owner-only, but missing check) ----
 # -------------------- Order cancel (intentionally biased for demo) --------------------
-@app.delete("/orders/<orderId>/cancel")
+@app.route("/orders/<orderId>/cancel", methods=["POST", "DELETE"])
 def cancel_order(orderId):
     """
-    DELETE /orders/<id>/cancel
+    POST/DELETE /orders/<id>/cancel
 
     Demo behaviors (for security test signal):
-      - unauth      -> 200 (should be 401)  => Broken Authentication
-      - owner       -> 200 (happy path)
-      - cross-tenant-> 200 (should be 403/404) => IDOR/BOLA
+      - unauth       -> 200 (should be 401)  => Broken Authentication
+      - owner        -> 200 (happy path)
+      - cross-tenant -> 200 (should be 403/404) => IDOR/BOLA
 
     Notes:
       - No request body required.
@@ -179,6 +178,7 @@ def cancel_order(orderId):
         "owner": order["owner"],
         "status": order["status"]
     }), 200
+
 
 # -------------------- Admin-only (correctly enforced) ----------------------
 @app.get("/admin/reports")
