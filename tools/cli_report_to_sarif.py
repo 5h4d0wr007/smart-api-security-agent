@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import json, sys, re
+from typing import Any, Dict, List
 
 def guess_category(name: str, level_hint: str) -> str:
-    s = name.lower()
+    s = (name or "").lower()
     if "unauth" in s or "401" in s:
         return "Authentication"
     if "forbidden" in s or "role" in s or "403" in s:
@@ -16,12 +17,61 @@ def guess_category(name: str, level_hint: str) -> str:
     return level_hint or "General"
 
 def level_from_name(name: str) -> str:
-    s = name.lower()
+    s = (name or "").lower()
     if "unauth" in s or "forbidden" in s or "role" in s:
         return "error"
     if "invalid" in s or "conflict" in s or "400" in s or "409" in s:
         return "warning"
     return "note"
+
+def _safe_get(d: Dict[str, Any], path: List[str], default=None):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict) or p not in cur:
+            return default
+        cur = cur[p]
+    return cur
+
+def _collect_failures_from_executions(run_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Fallback collector for Postman/Newman-style schema:
+      run.executions[] -> assertions[] -> if assertion.error present -> failed
+    We normalize each failure to the same shape used by the main loop:
+      {"error": {"test": str, "message": str}, "source": {"name": str}}
+    """
+    out: List[Dict[str, Any]] = []
+    executions = run_obj.get("executions") or []
+    if not isinstance(executions, list):
+        return out
+
+    for ex in executions:
+        # Try several common places to find the request/item name
+        item_name = (
+            _safe_get(ex, ["item", "name"]) or
+            _safe_get(ex, ["request", "name"]) or
+            ex.get("itemName") or
+            ex.get("cursor", {}).get("iterationData", {}).get("name") or
+            "request"
+        )
+        assertions = ex.get("assertions") or []
+        if not isinstance(assertions, list):
+            continue
+        for a in assertions:
+            err = a.get("error")
+            if not err:
+                continue  # passed assertion
+            test_name = a.get("assertion") or a.get("name") or err.get("name") or err.get("message") or "Security test failed"
+            # Normalize to our expected structure
+            out.append({
+                "error": {
+                    "test": test_name,
+                    "message": err.get("message") or test_name
+                },
+                "source": {
+                    "name": item_name
+                }
+            })
+    return out
 
 def main():
     if len(sys.argv) < 3:
@@ -35,13 +85,27 @@ def main():
         print(f"[ERROR] cannot read {run_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    failures = data.get("run", {}).get("failures", []) or data.get("failures", []) or []
-    results = []
+    # Prefer the top-level failures array if present; otherwise derive from executions.
+    failures = (
+        _safe_get(data, ["run", "failures"], []) or
+        data.get("failures", []) or
+        _collect_failures_from_executions(_safe_get(data, ["run"], {}) or {})
+    )
+
+    results: List[Dict[str, Any]] = []
 
     for f in failures:
         err = f.get("error", {}) or {}
+        # Test name/message
         test_name = err.get("test") or err.get("message") or "Security test failed"
-        item_name = f.get("source", {}).get("name") or f.get("parent", {}).get("name") or "request"
+        # Where it failed (request name)
+        item_name = (
+            _safe_get(f, ["source", "name"]) or
+            _safe_get(f, ["parent", "name"]) or
+            f.get("itemName") or
+            "request"
+        )
+
         level = level_from_name(test_name)
         category = guess_category(test_name, level)
 
@@ -59,7 +123,7 @@ def main():
             "properties": {"category": category, "endpoint": item_name}
         })
 
-    # Default note if all passed
+    # Default note if all passed (or nothing was executed)
     if not results:
         results.append({
             "ruleId": "postman.security.cleanrun",
