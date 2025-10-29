@@ -1,99 +1,143 @@
 #!/usr/bin/env python3
-import json, sys, re
-from typing import Any, Dict, List
+# tools/postman_json_to_sarif.py
+#
+# Convert Postman CLI JSON run report -> SARIF v2.1.0
+# - Robust to missing run.failures
+# - Extracts failed tests from executions[*].tests
+# - Produces GitHub-friendly artifactLocation URIs (no scheme/colon/spaces)
 
-def load_json(path: str) -> Dict[str, Any]:
+import json
+import sys
+import re
+from pathlib import Path
+
+def load_json(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def save_json(obj: Dict[str, Any], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
+def slugify(s: str) -> str:
+    # remove http://127.0.0.1:8000 etc and collapse to a safe relative path
+    s = re.sub(r"https?://", "", s, flags=re.IGNORECASE)
+    s = s.replace("127.0.0.1:8000", "")
+    s = s.strip()
+    # no spaces / punctuation that SARIF/GitHub might dislike in first segment
+    s = re.sub(r"[^A-Za-z0-9/_-]+", "_", s)
+    s = re.sub(r"_+", "_", s)
+    s = s.strip("_/")
+    if not s:
+        s = "request"
+    return f"postman/{s}"
 
-def to_uri_from_request(req: Dict[str, Any]) -> str:
-    method = str(req.get("method") or "GET").upper()
-    url = req.get("url") or {}
-    host_parts = url.get("host") or []
-    host = ".".join(map(str, host_parts)) if host_parts else ""
-    port = f":{url.get('port')}" if url.get("port") else ""
-    path_parts = url.get("path") or []
-    path = "/" + "/".join(map(str, path_parts)) if path_parts else "/"
-    return f"{method} {host}{port}{path}".strip()
+def infer_level(assertion: str, message: str) -> str:
+    t = f"{assertion} {message}".lower()
+    if any(k in t for k in ["unauth", "401", "forbidden", "403", "authorization", "role"]):
+        return "error"
+    if any(k in t for k in ["bad request", "400", "validation", "conflict", "409"]):
+        return "warning"
+    return "note"
 
-def to_rule_id(request_name: str, test_name: str) -> str:
-    base = f"{request_name} {test_name}".lower()
-    return (re.sub(r"[^a-z0-9]+", "-", base).strip("-") or "postman-assertion-failed")[:120]
+def rule_id_from(assertion: str) -> str:
+    base = assertion or "postman_assertion"
+    base = re.sub(r"[^A-Za-z0-9_-]+", "_", base)
+    base = re.sub(r"_+", "_", base).strip("_")
+    return f"postman.{base or 'assertion'}"
 
-def convert(run_json: Dict[str, Any]) -> Dict[str, Any]:
-    run = run_json.get("run") or {}
-    executions: List[Dict[str, Any]] = run.get("executions") or []
-    rules_by_id: Dict[str, Dict[str, Any]] = {}
-    results: List[Dict[str, Any]] = []
+def build_sarif(run_json: dict) -> dict:
+    executions = (run_json.get("run", {}).get("executions") or [])
+    results = []
+    rules_dict = {}
 
     for ex in executions:
-        req = ex.get("requestExecuted") or ex.get("request") or {}
-        req_name = req.get("name") or "(unnamed request)"
-        req_uri = to_uri_from_request(req)
-        http_code = (ex.get("response") or {}).get("code")
-        tests = ex.get("tests") or []
+        item_name = (ex.get("requestExecuted") or {}).get("name") or "request"
+        safe_uri = slugify(item_name)
 
-        for t in tests:
-            if t.get("status") != "failed":
+        for t in (ex.get("tests") or []):
+            status = t.get("status")
+            if status != "failed":
                 continue
-            test_name = t.get("name") or "assertion"
-            rule_id = to_rule_id(req_name, test_name)
-            if rule_id not in rules_by_id:
-                rules_by_id[rule_id] = {
-                    "id": rule_id,
-                    "name": test_name,
-                    "shortDescription": {"text": f'Failed Postman test: {test_name}'},
-                    "fullDescription": {"text": f'Request "{req_name}" failed test "{test_name}".'},
-                    "defaultConfiguration": {"level": "error"},
-                    "properties": {"tags": ["postman", "security-test"]},
-                }
+            assertion = t.get("name") or (t.get("error") or {}).get("test") or "Assertion failed"
             err = t.get("error") or {}
-            msg = err.get("message") or f'Postman test "{test_name}" failed for request "{req_name}".'
-            if http_code is not None:
-                msg = f"{msg} (response code {http_code})"
+            message = err.get("message") or "Assertion failed"
+
+            level = infer_level(assertion, message)
+            rid = rule_id_from(assertion)
+
+            # Keep a rule entry (with a readable description) once per ruleId
+            if rid not in rules_dict:
+                rules_dict[rid] = {
+                    "id": rid,
+                    "name": assertion[:64],
+                    "shortDescription": {"text": assertion},
+                    "fullDescription": {"text": assertion},
+                    "help": {"text": "Postman assertion failure detected during security test run."},
+                    "defaultConfiguration": {"level": level},
+                }
+
             results.append({
-                "ruleId": rule_id,
-                "level": "error",
-                "message": {"text": msg},
+                "ruleId": rid,
+                "level": level,
+                "message": {"text": f"{item_name}: {message}"},
                 "locations": [{
                     "physicalLocation": {
-                        "artifactLocation": {"uri": req_uri},
-                        "region": {"startLine": 1},
+                        # IMPORTANT: a relative, scheme-less path (no colon in first segment)
+                        "artifactLocation": {"uri": safe_uri},
+                        "region": {"startLine": 1, "startColumn": 1}
                     }
-                }],
-                "properties": {"requestName": req_name, "httpStatus": http_code},
+                }]
             })
 
-    return {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {"driver": {
-                "name": "Postman Security Test Agent",
-                "informationUri": "https://www.postman.com/",
-                "rules": list(rules_by_id.values()),
-            }},
-            "results": results,
-            "automationDetails": {"id": "postman-security-tests"},
-        }],
-    }
+    # Add a clean-run informational result when nothing failed (keeps the upload meaningful)
+    if not results:
+        rid = "postman.security.cleanrun"
+        rules_dict[rid] = {
+            "id": rid,
+            "name": "No security assertion failures",
+            "shortDescription": {"text": "No security test failures"},
+            "fullDescription": {"text": "Postman security tests reported zero failed assertions."},
+            "help": {"text": "Review run.json for details."},
+            "defaultConfiguration": {"level": "note"},
+        }
+        results.append({
+            "ruleId": rid,
+            "level": "note",
+            "message": {"text": "No failed assertions were detected."},
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": "postman/clean_run"},
+                    "region": {"startLine": 1, "startColumn": 1}
+                }
+            }]
+        })
 
-def main(argv: List[str]) -> int:
-    if len(argv) != 3:
-        print("Usage: python tools/postman_json_to_sarif.py <input_run_json> <output_sarif_json>", file=sys.stderr)
-        return 2
-    input_path, output_path = argv[1], argv[2]
-    data = load_json(input_path)
-    sarif = convert(data)
-    save_json(sarif, output_path)
-    failed = len(sarif["runs"][0].get("results") or [])
-    total_execs = len((data.get("run") or {}).get("executions") or [])
-    print(f"Converted {failed} failed test(s) into SARIF results from {total_execs} execution(s).", file=sys.stderr)
-    return 0
+    sarif = {
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "Postman Security Test Agent",
+                    "informationUri": "https://www.postman.com",
+                    "rules": list(rules_dict.values())
+                }
+            },
+            "results": results
+        }]
+    }
+    return sarif
+
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: postman_json_to_sarif.py <run.json> <out.sarif.json>", file=sys.stderr)
+        sys.exit(2)
+
+    in_path = Path(sys.argv[1])
+    out_path = Path(sys.argv[2])
+    run_json = load_json(in_path)
+    sarif = build_sarif(run_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(sarif, f, indent=2)
+    print(f"Wrote SARIF -> {out_path}")
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    main()
