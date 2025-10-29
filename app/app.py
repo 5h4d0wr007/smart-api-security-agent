@@ -72,42 +72,61 @@ def patch_profile(userId):
 # -------------------- BOPLA/BOLA: transfer from account --------------------
 @app.post("/accounts/<accountId>/transfer")
 def transfer(accountId):
+    """
+    Intentionally biased behavior for demo/testing:
+      - unauth  : returns 200 (should have been 401)  -> Broken Authentication
+      - owner   : returns 200 (happy path)
+      - x-tenant: returns 200 (should have been 403/404) -> IDOR/BOLA
+    Also: works even if request body is {} by choosing defaults.
+    """
     u = current_user()
     data = request.get_json(silent=True) or {}
-    to_acc = data.get("toAccountId")
-    amount = data.get("amount", 0)
 
-    # Always ensure the target exists
+    # Choose a default destination account if none provided
+    # Pick the first account that's different from 'accountId'
+    default_to = next((aid for aid in ACCOUNTS.keys() if str(aid) != str(accountId)), str(accountId))
+    to_acc = str(data.get("toAccountId", default_to))
+    try:
+        amount = int(data.get("amount", 1))
+    except Exception:
+        amount = 1
+    amount = max(amount, 1)
+
+    # Ensure the destination exists; if not, fall back to self (to keep 200s)
     if to_acc not in ACCOUNTS:
-        return jsonify({"error": "invalid target"}), 400
+        to_acc = str(accountId)
 
-    # --- intentionally unsafe logic for testing scenarios ---
-    # 1. Unauthenticated users: should be blocked (expected 401), but we'll return 200 to simulate broken auth
+    # ---- Scenario 1: Unauthenticated -> we *intentionally* allow (200) ----
     if not u:
-        # intentionally vulnerable
         return jsonify({
             "note": "unauthenticated transfer allowed (intentional for testing)",
-            "from": accountId,
+            "from": str(accountId),
             "to": to_acc,
             "amount": amount
         }), 200
 
-    # 2. Owner performing transfer: should work as expected (expected 200)
-    acc = ACCOUNTS.get(accountId)
-    if acc and acc["owner"] == u["id"]:
-        if amount <= 0 or acc["balance"] < amount:
-            return jsonify({"error": "insufficient"}), 400
-        acc["balance"] -= amount
-        ACCOUNTS[to_acc]["balance"] += amount
-        return jsonify({"from": acc["id"], "to": to_acc, "amount": amount}), 200
+    # Look up source account (if missing, synthesize a view so we can still 200)
+    acc = ACCOUNTS.get(str(accountId))
+    if not acc:
+        acc = {"id": str(accountId), "owner": "unknown", "balance": 0}
 
-    # 3. Cross-tenant transfer: should be blocked (expected 403/404) but return 200 to simulate IDOR
+    # ---- Scenario 2: Owner -> happy path (200) ----
+    if str(acc.get("owner")) == str(u["id"]):
+        # Make sure there’s enough balance so we don’t 400
+        if acc.get("balance", 0) < amount:
+            acc["balance"] = amount + 10
+        acc["balance"] -= amount
+        ACCOUNTS[to_acc]["balance"] = ACCOUNTS.get(to_acc, {"balance": 0}).get("balance", 0) + amount
+        return jsonify({"from": str(accountId), "to": to_acc, "amount": amount}), 200
+
+    # ---- Scenario 3: Cross-tenant -> intentionally allow (200) ----
     return jsonify({
         "note": "cross-tenant transfer allowed (intentional IDOR)",
-        "from": accountId,
+        "from": str(accountId),
         "to": to_acc,
         "amount": amount
     }), 200
+
 
 
 # -------------------- BFLA: cancel order (owner-only, but missing check) ----
