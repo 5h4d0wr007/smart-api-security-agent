@@ -129,55 +129,41 @@ def transfer(accountId):
 
 
 
-# -------------------- Order cancel (intentionally biased for demo) --------------------
-@app.route("/orders/<orderId>/cancel", methods=["POST", "DELETE"])
-def cancel_order(orderId):
+# -------------------- Orders: DELETE /orders/{id}/cancel --------------------
+@app.delete("/orders/<order_id>/cancel")
+def delete_order_cancel(order_id: str):
     """
-    POST/DELETE /orders/<id>/cancel
+    DELETE /orders/{id}/cancel
 
-    Demo behaviors (for security test signal):
-      - unauth       -> 200 (should be 401)  => Broken Authentication
-      - owner        -> 200 (happy path)
-      - cross-tenant -> 200 (should be 403/404) => IDOR/BOLA
+    Demo behaviors aligned with your plan:
+      - unauth                 -> 401 (blocked)
+      - owner (user id=1)
+          - id=201 (own order) -> 200 (allowed)
+          - id=202 (x-tenant)  -> 403 (blocked)
+      - others                 -> 403 (blocked)
 
-    Notes:
-      - No request body required.
-      - If the order doesn't exist, we synthesize it so responses are 200 and not 404.
+    We model order ownership as:
+      201 -> tenant/user 1
+      202 -> tenant/user 2
     """
     u = current_user()
-
-    # Ensure we have an order object to talk about
-    oid = str(orderId)
-    order = ORDERS.get(oid)
-    if not order:
-        # Synthesize a minimal order; pick a stable "owner" so 201/202 map as expected
-        default_owner = "1" if oid.endswith("1") else "2"
-        order = {"id": oid, "owner": default_owner, "status": "open"}
-        ORDERS[oid] = order
-
-    # ---- Scenario 1: Unauthenticated -> intentionally allowed (200) ----
     if not u:
-        order["status"] = "cancelled"
-        return jsonify({
-            "note": "unauthenticated cancel allowed (intentional for testing)",
-            "id": oid,
-            "owner": order["owner"],
-            "status": order["status"]
-        }), 200
+        return jsonify({"error": "unauthenticated"}), 401
 
-    # ---- Scenario 2: Owner -> happy path (200) ----
-    if str(order.get("owner")) == str(u["id"]):
-        order["status"] = "cancelled"
-        return jsonify({"id": oid, "owner": order["owner"], "status": order["status"]}), 200
+    owner_id = "1"
+    # toy ownership map for the demo
+    order_owner = {"201": "1", "202": "2"}
 
-    # ---- Scenario 3: Cross-tenant -> intentionally allowed (200) ----
-    order["status"] = "cancelled"
-    return jsonify({
-        "note": "cross-tenant cancel allowed (intentional IDOR)",
-        "id": oid,
-        "owner": order["owner"],
-        "status": order["status"]
-    }), 200
+    # Unknown order -> 404 (safe default)
+    if order_id not in order_owner:
+        return jsonify({"error": "not_found"}), 404
+
+    # Allow only the true owner (user 1 for 201 in this demo)
+    if str(u.get("id")) == order_owner[order_id]:
+        return jsonify({"id": order_id, "status": "canceled"}), 200
+
+    # Cross-tenant / not owner -> block
+    return jsonify({"error": "forbidden"}), 403
 
 
 # -------------------- Admin reports (allow owner, block others) --------------------
