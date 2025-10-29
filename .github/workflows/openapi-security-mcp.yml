@@ -135,7 +135,7 @@ jobs:
         run: |
           python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # === Sticky PR comment + Job Summary (NOW reads run.run.failures first) ===
+      # === Sticky PR comment + Job Summary (robust, layout-agnostic parser) ===
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
@@ -145,73 +145,84 @@ jobs:
           function severityFrom(text) {
             const s = (text||'').toLowerCase();
             if (s.includes('unauth') || s.includes('401') || s.includes('forbidden') || s.includes('role') || s.includes('403')) return 'error';
-            if (s.includes('invalid') || s.includes('400') || s.includes('conflict') || s.includes('409')) return 'warning';
+            if (s.includes('invalid') || s.includes('400') || s.includes('conflict') || s.includes('409') || s.includes('bad request')) return 'warning';
             return 'note';
           }
           const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
 
-          // Prefer SARIF only if it contains non-placeholder results
           let sarifResults = [];
           try {
             const s = JSON.parse(fs.readFileSync('sarif.json','utf8'));
             sarifResults = (((s.runs||[{}])[0]||{}).results)||[];
-          } catch(e){}
+          } catch {}
 
-          let run = null;
-          try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch(e){}
+          let run;
+          try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
 
-          function rowsFromFailures(r) {
-            const fails = (r && r.run && Array.isArray(r.run.failures)) ? r.run.failures : [];
-            const out = [];
-            for (const f of fails) {
-              const itemName =
-                (f.parent && f.parent.name) ||
-                (f.source && f.source.name) ||
-                (f.cursor && f.cursor.item && f.cursor.item.name) ||
-                'request';
-              const testName = (f.error && (f.error.test || f.error.name)) || 'Assertion failed';
-              const detail = (f.error && f.error.message) || '';
-              const lvl = severityFrom(`${testName} ${detail}`);
-              const category = (lvl==='error' ? 'Authorization/Authentication' : 'Validation');
-              out.push({
-                level: lvl,
-                message: `[${category}] ${itemName}: ${testName}${detail ? ' — ' + detail : ''}`
-              });
+          // ---- Generic deep scanners (cover Postman CLI / Newman variants) ----
+          function deepScanFailures(node, out=[]) {
+            if (!node) return out;
+            if (Array.isArray(node)) {
+              for (const v of node) deepScanFailures(v, out);
+              return out;
             }
-            return out;
-          }
+            if (typeof node === 'object') {
+              // If this object has a 'failures' array, harvest it
+              if (Array.isArray(node.failures) && node.failures.length) {
+                for (const f of node.failures) {
+                  const itemName =
+                    (f.parent && f.parent.name) ||
+                    (f.source && (f.source.name || (f.source.request && f.source.request.name))) ||
+                    (f.cursor && f.cursor.item && (f.cursor.item.name || f.cursor.item.id)) ||
+                    (node.item && node.item.name) ||
+                    'request';
 
-          function rowsFromExecutions(r) {
-            const out = [];
-            if (!r || !r.run) return out;
-            const executions = Array.isArray(r.run.executions) ? r.run.executions : [];
-            for (const ex of executions) {
-              const itemName =
-                (((ex.item||{}).name) ||
-                 ((ex.request||{}).name) ||
-                 ex.itemName ||
-                 'request');
-              const assertions = Array.isArray(ex.assertions) ? ex.assertions : [];
-              for (const a of assertions) {
-                if (!a.error) continue;
-                const testName = a.assertion || a.name || (a.error && a.error.message) || 'Security test failed';
-                const lvl = severityFrom(testName);
-                const category = (lvl==='error' ? 'Authorization/Authentication' : 'Validation');
-                out.push({ level: lvl, message: `[${category}] ${itemName}: ${testName}` });
+                    const testName =
+                      (f.error && (f.error.test || f.error.name)) ||
+                      f.assertion ||
+                      'Assertion failed';
+
+                    const detail = (f.error && (f.error.message || f.error.showDiff && `${f.error.actual} vs ${f.error.expected}`)) || '';
+
+                    const lvl = severityFrom(`${testName} ${detail}`);
+                    const category = (lvl === 'error' ? 'Authorization/Authentication' : 'Validation');
+
+                    out.push({ level: lvl, message: `[${category}] ${itemName}: ${testName}${detail ? ' — ' + detail : ''}` });
+                }
               }
+              // If this object has 'executions', look for assertions with errors
+              if (Array.isArray(node.executions)) {
+                for (const ex of node.executions) {
+                  const itemName =
+                    (ex.item && ex.item.name) ||
+                    (ex.request && ex.request.name) ||
+                    ex.itemName || 'request';
+                  const assertions = Array.isArray(ex.assertions) ? ex.assertions : [];
+                  for (const a of assertions) {
+                    const err = a.error || null;
+                    if (!err) continue;
+                    const testName = a.assertion || a.name || err.name || 'Security test failed';
+                    const detail = err.message || '';
+                    const lvl = severityFrom(`${testName} ${detail}`);
+                    const category = (lvl === 'error' ? 'Authorization/Authentication' : 'Validation');
+                    out.push({ level: lvl, message: `[${category}] ${itemName}: ${testName}${detail ? ' — ' + detail : ''}` });
+                  }
+                }
+              }
+              // Recurse into all properties
+              for (const k of Object.keys(node)) deepScanFailures(node[k], out);
             }
             return out;
           }
 
-          const nonCleanSarif = sarifResults.filter(r => (r.ruleId||'') !== 'postman.security.cleanrun');
+          const failureRows = deepScanFailures(run);
 
-          // Priority: run.failures → run.executions.assertions → SARIF
-          let rows = [];
-          rows = rowsFromFailures(run);
-          if (rows.length === 0) rows = rowsFromExecutions(run);
+          // Fallback to SARIF only if we truly found nothing
+          let rows = failureRows;
+          const nonCleanSarif = sarifResults.filter(r => (r.ruleId||'') !== 'postman.security.cleanrun');
           if (rows.length === 0 && nonCleanSarif.length > 0) {
             rows = nonCleanSarif.map(r => ({
-              level: r.level||'note',
+              level: r.level || 'note',
               message: (r.message && r.message.text) || '(no message)'
             }));
           }
