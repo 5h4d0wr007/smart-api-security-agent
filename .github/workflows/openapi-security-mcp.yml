@@ -1,35 +1,35 @@
-name: test-on-openapi-change
+name: OpenAPI → Security tests with Postman MCP
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
     paths:
-      - "openapi/**"
-      - "api/**"
-      - ".github/workflows/test-on-openapi-change.yml"
+      - "openapi/**.y*ml"
+      - "openapi/**.json"
+      - "app/**"
       - "tools/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
   security-events: write
+  actions: read
   pull-requests: write
+
+env:
+  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
+  POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
 
 jobs:
   test-on-openapi-change:
     runs-on: ubuntu-latest
-    env:
-      # Keep artifact locations consistent with your existing run
-      ARTIFACT_DIR: artifacts
-      RUN_JSON: artifacts/run.json
-      SARIF_JSON: artifacts/sarif.json
-      PLAN_JSON: artifacts/plan.json
-      DIFF_JSON: artifacts/diff.json
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # ---------- Setup toolchains ----------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -43,118 +43,210 @@ jobs:
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r app/requirements.txt
+          pip install openai requests
 
       - name: Install CLI tooling (Postman CLI + swagger-cli)
         run: |
-          npm i -g @postman/cli swagger-cli
+          # Postman CLI (official)
+          curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
+          # OpenAPI validator
+          npm i -g @apidevtools/swagger-cli@4
           postman --version
           swagger-cli --version
 
       - name: Install oasdiff (Linux binary, pinned)
         run: |
-          OASDIFF_VERSION="2.10.1"
-          curl -sSL -o /usr/local/bin/oasdiff \
-            "https://github.com/Tufin/oasdiff/releases/download/v${OASDIFF_VERSION}/oasdiff-linux-amd64"
-          chmod +x /usr/local/bin/oasdiff
-          oasdiff version
+          set -euo pipefail
+          OASDIFF_VERSION="v1.10.28"
+          TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
+          URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          echo "Downloading oasdiff ${OASDIFF_VERSION}…"
+          if ! curl -fL "$URL_PRIMARY" -o oasdiff.tgz; then
+            echo "Primary URL failed, trying fallback…"
+            curl -fL "$URL_FALLBACK" -o oasdiff.tgz
+          fi
+          tar -xzf oasdiff.tgz
+          chmod +x oasdiff
+          sudo mv oasdiff /usr/local/bin/oasdiff
 
-      # ---------- Spin up sample app (adjust command if yours differs) ----------
       - name: Start sample app (localhost:8000)
         run: |
-          set -e
-          nohup python tools/dev_app.py > app.log 2>&1 &
-          # Wait until port 8000 is open
-          for i in {1..50}; do
-            nc -z 127.0.0.1 8000 && break
-            sleep 0.2
+          python app/app.py &
+          echo $! > app.pid
+          # Warm up; just need the server responding
+          for i in {1..20}; do
+            if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
+              echo "App is up"
+              break
+            fi
+            sleep 1
           done
 
-      # ---------- Compute OpenAPI diff ----------
       - name: Compute OpenAPI diff (base vs head)
-        id: diff
         run: |
-          mkdir -p "$ARTIFACT_DIR"
-          # Update these paths to match your repo locations, if needed
-          BASE_SPEC="openapi/base.yaml"
-          HEAD_SPEC="openapi/head.yaml"
-          oasdiff -format json $BASE_SPEC $HEAD_SPEC > "$DIFF_JSON" || true
-          echo "diff_path=$DIFF_JSON" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          BASE=origin/${{ github.base_ref }}
+          HEAD=origin/${{ github.head_ref }}
+          mkdir -p .tmp
+          FILE=$(git diff --name-only "$BASE...$HEAD" | grep -E '^openapi/.*\.(ya?ml|json)$' | head -n1 || true)
+          if [ -z "${FILE:-}" ]; then
+            echo "No OpenAPI changes detected."
+            echo '{}' > diff.json
+          else
+            git show "$BASE:$FILE" > .tmp/base.yaml || cp openapi/api.v1.yaml .tmp/base.yaml
+            git show "$HEAD:$FILE" > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
+            swagger-cli validate .tmp/base.yaml
+            swagger-cli validate .tmp/head.yaml
+            oasdiff diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
+          fi
+          echo "Wrote diff.json"
 
-      # ---------- Plan via MCP and generate/overwrite collection ----------
       - name: LLM → plan & create/overwrite collection via official Postman MCP
+        env:
+          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
           python tools/agent_openapi_to_postman.py \
-            --diff "$DIFF_JSON" \
-            --out-plan "$PLAN_JSON" \
-            --out-collection "$ARTIFACT_DIR/collection.json"
+            --base openapi/api.v1.yaml \
+            --head openapi/api.yaml \
+            --diff diff.json \
+            --collection "security test collection" \
+            --plan plan.json
 
-      # ---------- Postman auth (non-interactive). Expects POSTMAN_API_KEY in secrets ----------
       - name: Postman CLI login (non-interactive)
         env:
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
         run: |
-          if [ -z "$POSTMAN_API_KEY" ]; then
-            echo "POSTMAN_API_KEY is not set"; exit 1
-          fi
-          postman login --with-api-key $POSTMAN_API_KEY
+          postman login --with-api-key "$POSTMAN_API_KEY"
 
-      # ---------- Run the generated collection and capture JSON report ----------
       - name: Run generated collection with Postman CLI (JSON reporter)
+        continue-on-error: true
         run: |
-          mkdir -p "$ARTIFACT_DIR"
-          postman collection run "$ARTIFACT_DIR/collection.json" --integration-id "github" --reporters json --reporter-json-export "$RUN_JSON" || true
-          test -f "$RUN_JSON" || { echo "run.json not found"; cat "$ARTIFACT_DIR" || true; exit 1; }
-          echo "Postman run saved to $RUN_JSON"
+          postman collection run ./generated-security-test.postman_collection.json \
+            --reporters cli,json \
+            --reporter-json-export run.json \
+          || true
+          # ensure run.json exists so the next step never crashes
+          [ -f run.json ] || echo '{"run":{"failures":[],"stats":{"assertions":{"total":0,"failed":0}}}}' > run.json
 
-      # ---------- Convert Postman report → SARIF (NEW STEP) ----------
-      - name: Convert Postman JSON → SARIF
+      - name: Convert Postman report → SARIF
         run: |
-          node tools/postman_json_to_sarif.js "$RUN_JSON" > "$SARIF_JSON"
-          echo "SARIF results: $(jq '.runs[0].results | length' "$SARIF_JSON")"
+          python tools/cli_report_to_sarif.py run.json sarif.json
 
-      # ---------- (Optional) Build PR summary markdown from SARIF count ----------
+      # === Sticky PR comment + Job Summary (reliable failure detection) ===
       - name: Build PR summary markdown
+        if: github.event_name == 'pull_request'
         run: |
-          COUNT=$(jq '.runs[0].results | length' "$SARIF_JSON")
-          {
-            echo "Postman Security Test Agent — Findings"
-            echo
-            echo "Detected ${COUNT} finding(s)."
-            echo
-            echo "Artifacts: \`diff.json\`, \`plan.json\`, \`run.json\`, \`sarif.json\`, and the generated collection are attached to this run."
-          } > pr-summary.md
+          node <<'NODE'
+          const fs = require('fs');
 
-      - name: Run marocchino/sticky-pull-request-comment@v2
-        uses: marocchino/sticky-pull-request-comment@v2
+          const emoji = (l)=>({error:'❌',warning:'⚠️',note:'ℹ️'})[l]||'❔';
+          const severityFrom = (t)=>{
+            const s=(t||'').toLowerCase();
+            if (s.includes('unauth')||s.includes('401')||s.includes('forbidden')||s.includes('role')||s.includes('403')) return 'error';
+            if (s.includes('invalid')||s.includes('400')||s.includes('conflict')||s.includes('409')||s.includes('bad request')) return 'warning';
+            return 'note';
+          };
+
+          // Load SARIF
+          let sarif = null;
+          try { sarif = JSON.parse(fs.readFileSync('sarif.json','utf8')); } catch {}
+          const sarifResults = (((sarif?.runs||[])[0]||{}).results)||[];
+          const nonCleanSarif = sarifResults.filter(r => (r.ruleId||'') !== 'postman.security.cleanrun');
+
+          // Load Postman run.json
+          let runJson = null;
+          try { runJson = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
+
+          // Robust failure counts from either stats or failures array
+          let failedCount = 0;
+          if (runJson?.run?.stats?.assertions && Number.isFinite(runJson.run.stats.assertions.failed)) {
+            failedCount = Math.max(failedCount, Number(runJson.run.stats.assertions.failed)||0);
+          }
+          if (Array.isArray(runJson?.run?.failures)) {
+            failedCount = Math.max(failedCount, runJson.run.failures.length);
+          }
+
+          // Try to extract per-assertion messages when available
+          const rows = [];
+          if (Array.isArray(runJson?.run?.failures) && runJson.run.failures.length) {
+            for (const f of runJson.run.failures) {
+              const assertion = f.assertion || f.error?.test || f.error?.name || 'Assertion failed';
+              const msg = f.error?.message || '';
+              const itemName =
+                f.parent?.name ||
+                f.source?.name ||
+                f.cursor?.item?.name ||
+                'request';
+              const lvl = severityFrom(`${assertion} ${msg}`);
+              const category = (lvl==='error' ? 'Authorization/Authentication' : 'Validation');
+              rows.push({ level: lvl, message: `[${category}] ${itemName}: ${assertion}${msg ? ' — ' + msg : ''}` });
+            }
+          } else if (nonCleanSarif.length) {
+            for (const r of nonCleanSarif) {
+              rows.push({
+                level: r.level || 'note',
+                message: (r.message && r.message.text) || '(no message)'
+              });
+            }
+          } else if (failedCount > 0) {
+            // Stats-only fallback (no per-assertion detail available)
+            rows.push({
+              level: 'error',
+              message: `[Authorization/Authentication] Test suite: ${failedCount} assertion(s) failed — see run.json for details`
+            });
+          }
+
+          const total = rows.length;
+          const lines = [];
+          lines.push('**Postman Security Test Agent — Findings**');
+          lines.push('');
+          lines.push(`Detected **${total}** finding${total===1?'':'s'}.`);
+          if (total === 0) {
+            lines.push('');
+            lines.push('> ✅ No security test failures detected');
+          } else {
+            lines.push('');
+            lines.push('|  | Severity | Finding |');
+            lines.push('|---|---|---|');
+            for (const r of rows) lines.push(`| ${emoji(r.level)} | ${r.level} | ${r.message} |`);
+          }
+          lines.push('');
+          lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
+          fs.writeFileSync('sarif_summary.md', lines.join('\n'));
+          NODE
+
+      - uses: marocchino/sticky-pull-request-comment@v2
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
         with:
-          recreate: true
-          path: pr-summary.md
+          header: Postman Security Summary
+          path: sarif_summary.md
 
-      # ---------- Upload SARIF to GitHub Code Scanning (NEW STEP) ----------
+      # Upload SARIF pinned to PR head (only same-repo PRs / pushes)
       - name: Upload SARIF to GitHub Code Scanning
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: ${{ env.SARIF_JSON }}
-          category: postman-security-tests
+          sarif_file: sarif.json
+          category: openapi-postman-security
+          ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
+          sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
-      # ---------- Attach run artifacts ----------
       - name: Upload artifacts (diff, plan, run, sarif, collection)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: postman-security-test-artifacts
-          if-no-files-found: warn
+          name: api-security-output
           path: |
-            ${{ env.DIFF_JSON }}
-            ${{ env.PLAN_JSON }}
-            ${{ env.RUN_JSON }}
-            ${{ env.SARIF_JSON }}
-            artifacts/collection.json
+            diff.json
+            plan.json
+            run.json
+            sarif.json
+            generated-security-test.postman_collection.json
 
-      # ---------- Teardown ----------
       - name: Stop sample app
         if: always()
         run: |
-          pkill -f tools/dev_app.py || true
-          sleep 1
-          echo "Stopped app"
+          kill "$(cat app.pid)" 2>/dev/null || true
