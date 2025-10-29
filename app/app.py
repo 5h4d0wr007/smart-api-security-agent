@@ -130,17 +130,55 @@ def transfer(accountId):
 
 
 # -------------------- BFLA: cancel order (owner-only, but missing check) ----
-@app.post("/orders/<orderId>/cancel")
+# -------------------- Order cancel (intentionally biased for demo) --------------------
+@app.delete("/orders/<orderId>/cancel")
 def cancel_order(orderId):
+    """
+    DELETE /orders/<id>/cancel
+
+    Demo behaviors (for security test signal):
+      - unauth      -> 200 (should be 401)  => Broken Authentication
+      - owner       -> 200 (happy path)
+      - cross-tenant-> 200 (should be 403/404) => IDOR/BOLA
+
+    Notes:
+      - No request body required.
+      - If the order doesn't exist, we synthesize it so responses are 200 and not 404.
+    """
     u = current_user()
-    if not u:
-        return jsonify({"error": "unauthenticated"}), 401
-    order = ORDERS.get(orderId)
+
+    # Ensure we have an order object to talk about
+    oid = str(orderId)
+    order = ORDERS.get(oid)
     if not order:
-        return jsonify({"error": "not found"}), 404
-    # VULN: no owner/admin check -> any user can cancel anyone's order
+        # Synthesize a minimal order; pick a stable "owner" so 201/202 map as expected
+        default_owner = "1" if oid.endswith("1") else "2"
+        order = {"id": oid, "owner": default_owner, "status": "open"}
+        ORDERS[oid] = order
+
+    # ---- Scenario 1: Unauthenticated -> intentionally allowed (200) ----
+    if not u:
+        order["status"] = "cancelled"
+        return jsonify({
+            "note": "unauthenticated cancel allowed (intentional for testing)",
+            "id": oid,
+            "owner": order["owner"],
+            "status": order["status"]
+        }), 200
+
+    # ---- Scenario 2: Owner -> happy path (200) ----
+    if str(order.get("owner")) == str(u["id"]):
+        order["status"] = "cancelled"
+        return jsonify({"id": oid, "owner": order["owner"], "status": order["status"]}), 200
+
+    # ---- Scenario 3: Cross-tenant -> intentionally allowed (200) ----
     order["status"] = "cancelled"
-    return jsonify(order), 200
+    return jsonify({
+        "note": "cross-tenant cancel allowed (intentional IDOR)",
+        "id": oid,
+        "owner": order["owner"],
+        "status": order["status"]
+    }), 200
 
 # -------------------- Admin-only (correctly enforced) ----------------------
 @app.get("/admin/reports")
