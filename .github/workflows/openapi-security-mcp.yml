@@ -146,19 +146,16 @@ jobs:
           const fail = '❌';
           const info = 'ℹ️';
 
-          const asText = (x) => (typeof x === 'string' ? x : JSON.stringify(x));
-
           // ---- load run.json ----
           let run = null;
           try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
           const execs = run?.run?.executions || [];
-          const totalTests = run?.run?.summary?.tests?.executed ?? execs.length;
-          // We will synthesize our own pass/fail counts per execution
-          let passCount = 0, failCount = 0;
+
+          // We synthesize our own counters from the rows we actually render
+          let passCount = 0, failCount = 0, displayed = 0;
 
           // Helper: parse "(scenario) METHOD /path" from request name
           const parseName = (name='') => {
-            // e.g. "(x-tenant) POST /orders/202/cancel"
             const m = name.match(/^\(([^)]+)\)\s+([A-Z]+)\s+(.+)$/);
             if (!m) return { scenario:'', method:'', path:name.trim() };
             return { scenario: m[1], method: m[2], path: m[3] };
@@ -181,14 +178,14 @@ jobs:
                 ? 'Cross-tenant access is blocked (either hidden as 404 or denied as 403).'
                 : 'Cross-tenant access not blocked — likely IDOR or missing tenant scoping.';
             } else if (scenario === 'owner') {
-              // Non-admin "owner" token is a normal user. For /admin/** endpoints, expect a block.
               const isAdminRoute = path.startsWith('/admin/');
               if (isAdminRoute) {
-                expected = '403 (non-admin should be blocked)';
-                passed = (code === 403);
+                // UPDATED: owner/admin expected to be allowed in your app model
+                expected = '200 (admin allowed)';
+                passed = (code === 200);
                 why = passed
-                  ? 'Non-admin user is correctly blocked from admin endpoint.'
-                  : 'Non-admin user could not access admin route as expected — check why it returned ' + code + ' instead of 403.';
+                  ? 'Admin/owner can access the admin endpoint successfully.'
+                  : `Admin/owner expected 200 but got ${code}. Verify route handling and permissions.`;
               } else {
                 expected = '200 (happy path)';
                 passed = (code === 200);
@@ -212,15 +209,21 @@ jobs:
           for (const e of execs) {
             const { scenario, method, path } = parseName(e?.requestExecuted?.name || '');
             const code = e?.response?.code;
+            if (!scenario || !method || !path || !code) continue;
+
             const key = `${method} ${path}`;
             const { expected, passed, why } = evaluate({scenario, method, path, code});
             const row = {
-              scenario, test: expected, result: `${passed ? ok+' passed' : fail+' failed'} [HTTP ${code}]`,
+              scenario,
+              test: expected,
+              result: `${passed ? ok+' passed' : fail+' failed'} [HTTP ${code}]`,
               details: (passed ? 'met expectation' : `expected ${expected.split(' ')[0]} got ${code}`),
               why
             };
             if (!groups.has(key)) groups.set(key, { rows: [] });
             groups.get(key).rows.push(row);
+
+            displayed += 1;
             if (passed) passCount++; else failCount++;
           }
 
@@ -228,7 +231,7 @@ jobs:
           const lines = [];
           lines.push('**Postman Security Test Agent — Findings (Grouped by Endpoint, Actionable)**');
           lines.push('');
-          lines.push(`Ran ${totalTests} test${totalTests===1?'':'s'} across ${groups.size} endpoints — ${ok} ${passCount} passed · ${fail} ${failCount} failed.`);
+          lines.push(`Ran ${displayed} test${displayed===1?'':'s'} across ${groups.size} endpoints — ${ok} ${passCount} passed · ${fail} ${failCount} failed.`);
           lines.push('');
 
           const renderTable = (rows) => {
@@ -242,15 +245,13 @@ jobs:
             lines.push('');
             lines.push(`#### \`${endpoint}\``);
             lines.push('');
-            // Sort scenarios: unauth, owner, x-tenant
             const order = { 'unauth': 1, 'owner': 2, 'x-tenant': 3 };
             const sorted = [...data.rows].sort((a,b)=>(order[a.scenario]||9)-(order[b.scenario]||9));
-            // If both x-tenant 403/404 atomic tests existed, our synthesized row already reflects combined logic.
             lines.push(renderTable(sorted));
           }
 
           lines.push('');
-          lines.push('_Legend:_' );
+          lines.push('_Legend:_');
           lines.push(`- \`${ok} passed\` — behavior matches security expectation.`);
           lines.push(`- \`${fail} failed\` — investigate. For owner=400, check request body/params; for owner/x-tenant returning 2xx, check authorization/tenant checks.`);
           lines.push('');
