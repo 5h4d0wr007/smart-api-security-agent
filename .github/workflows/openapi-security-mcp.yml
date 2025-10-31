@@ -1,4 +1,4 @@
-name: OpenAPI → Security tests with Postman MCP
+name: API Security with LLM & Postman MCP
 
 on:
   pull_request:
@@ -16,9 +16,9 @@ permissions:
   pull-requests: write
 
 env:
-  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                # e.g. https://mcp.postman.com/mcp
-  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  # e.g. Security Demo
-  POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }}
+  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  
+  POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }} #Need to use for env sync via MCP later
 
 jobs:
   test-on-openapi-change:
@@ -48,9 +48,7 @@ jobs:
 
       - name: Install CLI tooling (Postman CLI + swagger-cli)
         run: |
-          # Postman CLI (official)
           curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
-          # OpenAPI validator
           npm i -g @apidevtools/swagger-cli@4
           postman --version
           swagger-cli --version
@@ -75,7 +73,6 @@ jobs:
         run: |
           python app/app.py &
           echo $! > app.pid
-          # Warm up; just need the server responding
           for i in {1..20}; do
             if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
               echo "App is up"
@@ -103,7 +100,7 @@ jobs:
           fi
           echo "Wrote diff.json"
 
-      - name: LLM → plan & create/overwrite collection via official Postman MCP
+      - name: LLM → plan & create/overwrite collection via Postman MCP
         env:
           OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
           POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
@@ -128,42 +125,36 @@ jobs:
             --reporters cli,json \
             --reporter-json-export run.json \
           || true
-          # ensure run.json exists so the next step never crashes
           [ -f run.json ] || echo '{"run":{"executions":[],"summary":{"tests":{"executed":0,"failed":0,"passed":0}}}}' > run.json
 
       - name: Convert Postman report → SARIF
         run: |
           python tools/postman_json_to_sarif.py run.json sarif.json
 
-      # === Sticky PR comment + Job Summary (actionable endpoint grouping) ===
       - name: Build PR summary markdown
         if: github.event_name == 'pull_request'
         run: |
           node <<'NODE'
           const fs = require('fs');
 
-          const ok = '✅';
-          const fail = '❌';
-          const info = 'ℹ️';
+          const ok = '✅'; #To be used for template based on LLM results - not determininstic
+          const fail = '❌'; #To be used for template based on LLM results - not determininstic
+          const info = 'ℹ️'; #To be used for template based on LLM results - not determininstic
 
           const asText = (x) => (typeof x === 'string' ? x : JSON.stringify(x));
 
-          // ---- load run.json ----
           let run = null;
           try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
           const execs = run?.run?.executions || [];
-          // (We won't trust Postman's raw assertion totals for the header.)
           let passCount = 0, failCount = 0;
 
-          // Helper: parse "(scenario) METHOD /path" from request name
           const parseName = (name='') => {
-            // e.g. "(x-tenant) POST /orders/202/cancel"
+            //e.g. Like in our case of hybrid LLM driven but deterministic skeleton: "(x-tenant) POST /orders/:id/cancel"
             const m = name.match(/^\(([^)]+)\)\s+([A-Z]+)\s+(.+)$/);
             if (!m) return { scenario:'', method:'', path:name.trim() };
             return { scenario: m[1], method: m[2], path: m[3] };
           };
 
-          // Expectation & interpretation for each scenario
           const evaluate = ({scenario, method, path, code}) => {
             let expected, passed, why;
 
@@ -172,7 +163,7 @@ jobs:
               passed = (code === 401);
               why = passed
                 ? 'Unauthenticated access is correctly rejected. Not a vulnerability.'
-                : 'Unauthenticated request was not blocked — potential Broken Authentication/IDOR.';
+                : 'Unauthenticated request was not blocked — potential Broken Authentication.';
             } else if (scenario === 'x-tenant') {
               expected = 'blocked (403 or 404)';
               passed = (code === 403 || code === 404);
@@ -205,8 +196,7 @@ jobs:
             return { expected, passed, why };
           };
 
-          // Group by endpoint (METHOD + path)
-          const groups = new Map(); // key -> {rows:[]}
+          const groups = new Map(); //key -> {rows:[]}
           for (const e of execs) {
             const { scenario, method, path } = parseName(e?.requestExecuted?.name || '');
             const code = e?.response?.code;
@@ -222,11 +212,9 @@ jobs:
             if (passed) passCount++; else failCount++;
           }
 
-          // >>> CHANGE: count only rendered rows for the header <<<
           const renderedCount = Array.from(groups.values())
             .reduce((n, g) => n + g.rows.length, 0);
 
-          // Build markdown
           const lines = [];
           lines.push('**Postman Security Test Agent — Findings (Grouped by Endpoint, Actionable)**');
           lines.push('');
@@ -244,7 +232,6 @@ jobs:
             lines.push('');
             lines.push(`#### \`${endpoint}\``);
             lines.push('');
-            // Sort scenarios: unauth, owner, x-tenant
             const order = { 'unauth': 1, 'owner': 2, 'x-tenant': 3 };
             const sorted = [...data.rows].sort((a,b)=>(order[a.scenario]||9)-(order[b.scenario]||9));
             lines.push(renderTable(sorted));
@@ -262,10 +249,9 @@ jobs:
       - uses: marocchino/sticky-pull-request-comment@v2
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
         with:
-          header: Postman Security Summary
+          header: API Security Summary
           path: sarif_summary.md
 
-      # Upload SARIF pinned to PR head (only same-repo PRs / pushes)
       - name: Upload SARIF to GitHub Code Scanning
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: github/codeql-action/upload-sarif@v3
