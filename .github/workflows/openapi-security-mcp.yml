@@ -137,9 +137,9 @@ jobs:
           node <<'NODE'
           const fs = require('fs');
 
-          const ok = '✅'; #To be used for template based on LLM results - not determininstic
-          const fail = '❌'; #To be used for template based on LLM results - not determininstic
-          const info = 'ℹ️'; #To be used for template based on LLM results - not determininstic
+          const ok = '✅'; //To be used for template based on LLM results - not determininstic
+          const fail = '❌'; //To be used for template based on LLM results - not determininstic
+          const info = 'ℹ️'; //To be used for template based on LLM results - not determininstic
 
           const asText = (x) => (typeof x === 'string' ? x : JSON.stringify(x));
 
