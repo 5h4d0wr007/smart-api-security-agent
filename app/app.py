@@ -2,14 +2,13 @@ from flask import Flask, jsonify, request
 
 app = Flask(__name__)
 
-# Users and tokens
+#In-memory for mocking user DB, and simulating sec. tests with this data. You can integrate the agent with your own app
 USERS = {
     "1": {"id": "1", "role": "user", "token": "t1"},
     "2": {"id": "2", "role": "user", "token": "t2"},
     "99": {"id": "99", "role": "admin", "token": "ta"},
 }
 
-# Data owned by users
 PROFILES = {
     "1": {"id": "1", "email": "u1@example.com", "name": "User One"},
     "2": {"id": "2", "email": "u2@example.com", "name": "User Two"},
@@ -24,7 +23,7 @@ ORDERS = {
 }
 
 def current_user():
-    # Accept either Authorization: Bearer <token> or Cookie: session=<token>
+    #Mocking to accept either Authorization: Bearer <token> or Cookie: session=<token>
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         token = auth.split(" ", 1)[1]
@@ -40,7 +39,6 @@ def current_user():
             return u
     return None
 
-# -------------------- BOLA: view another user's profile --------------------
 @app.get("/users/<userId>/profile")
 def get_profile(userId):
     u = current_user()
