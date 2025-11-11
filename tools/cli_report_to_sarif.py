@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#added with postman_json_to_sarif to cover different possibilities of CLI run output
 import json, sys, re
 from typing import Any, Dict, List
 
@@ -9,7 +9,7 @@ def guess_category(name: str, level_hint: str) -> str:
     if "forbidden" in s or "role" in s or "403" in s:
         return "Authorization (BFLA)"
     if "idor" in s or "object" in s or "404" in s:
-        return "Broken Object Level Authorization (BOLA)"
+        return "Broken Object Level Authorization (BOLA)" #BOLA/BOPLA/BFLA can be a group of 403/404
     if "invalid" in s or "400" in s:
         return "Input Validation"
     if "conflict" in s or "409" in s:
@@ -33,19 +33,12 @@ def _safe_get(d: Dict[str, Any], path: List[str], default=None):
     return cur
 
 def _collect_failures_from_executions(run_obj: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Fallback collector for Postman/Newman-style schema:
-      run.executions[] -> assertions[] -> if assertion.error present -> failed
-    We normalize each failure to the same shape used by the main loop:
-      {"error": {"test": str, "message": str}, "source": {"name": str}}
-    """
     out: List[Dict[str, Any]] = []
     executions = run_obj.get("executions") or []
     if not isinstance(executions, list):
         return out
 
     for ex in executions:
-        # Try several common places to find the request/item name
         item_name = (
             _safe_get(ex, ["item", "name"]) or
             _safe_get(ex, ["request", "name"]) or
@@ -59,9 +52,8 @@ def _collect_failures_from_executions(run_obj: Dict[str, Any]) -> List[Dict[str,
         for a in assertions:
             err = a.get("error")
             if not err:
-                continue  # passed assertion
+                continue 
             test_name = a.get("assertion") or a.get("name") or err.get("name") or err.get("message") or "Security test failed"
-            # Normalize to our expected structure
             out.append({
                 "error": {
                     "test": test_name,
@@ -85,7 +77,6 @@ def main():
         print(f"[ERROR] cannot read {run_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Prefer the top-level failures array if present; otherwise derive from executions.
     failures = (
         _safe_get(data, ["run", "failures"], []) or
         data.get("failures", []) or
@@ -96,9 +87,7 @@ def main():
 
     for f in failures:
         err = f.get("error", {}) or {}
-        # Test name/message
         test_name = err.get("test") or err.get("message") or "Security test failed"
-        # Where it failed (request name)
         item_name = (
             _safe_get(f, ["source", "name"]) or
             _safe_get(f, ["parent", "name"]) or
@@ -109,7 +98,6 @@ def main():
         level = level_from_name(test_name)
         category = guess_category(test_name, level)
 
-        # Build SARIF result
         results.append({
             "ruleId": f"postman.security.{category.replace(' ', '_').lower()}",
             "level": level,
@@ -123,7 +111,6 @@ def main():
             "properties": {"category": category, "endpoint": item_name}
         })
 
-    # Default note if all passed (or nothing was executed)
     if not results:
         results.append({
             "ruleId": "postman.security.cleanrun",
