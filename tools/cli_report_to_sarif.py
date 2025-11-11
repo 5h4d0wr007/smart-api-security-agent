@@ -1,4 +1,4 @@
-#[Backup Converter] added with postman_json_to_sarif (other converter) to cover different possibilities of CLI run output
+#[Backup Converter] added with postman_json_to_sarif (other converter) to cover different possibilities of CLI run output. E.g., Newman run
 import json, sys, re
 from typing import Any, Dict, List
 
