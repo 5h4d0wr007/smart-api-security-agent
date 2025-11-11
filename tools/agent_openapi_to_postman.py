@@ -1,11 +1,8 @@
-# tools/agent_openapi_to_postman.py
 import os, json, sys, subprocess, argparse, re, time
 from typing import Any, Dict, List, Optional
 from mcp_client import McpHttp
 from openai import OpenAI
 
-
-# ----------------- shell helper -----------------
 def run(cmd: list[str]) -> str:
     print("+", " ".join(cmd), flush=True)
     cp = subprocess.run(cmd, capture_output=True, text=True)
@@ -14,8 +11,6 @@ def run(cmd: list[str]) -> str:
         raise SystemExit(cp.returncode)
     return cp.stdout
 
-
-# ----------------- diff helpers -----------------
 def looks_empty_diff(diff_text: str) -> bool:
     try:
         d = json.loads(diff_text or "{}")
@@ -23,9 +18,7 @@ def looks_empty_diff(diff_text: str) -> bool:
     except Exception:
         return False
 
-
-# ----------------- LLM helpers -----------------
-def extract_json_from_fences(s: str) -> Any:
+def extract_json_from_fences(s: str) -> Any: #pulling JSON from generic LLM response
     m = re.search(r"```json\s*([\s\S]*?)```", s, re.IGNORECASE)
     if m:
         return json.loads(m.group(1))
@@ -36,7 +29,6 @@ def extract_json_from_fences(s: str) -> Any:
     if m:
         return json.loads(m.group(1))
     raise ValueError("No JSON found in content")
-
 
 def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
     system = (
@@ -52,20 +44,18 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
         "- Happy path (2xx)\n"
         "Return ONLY JSON (array or an object with an 'items' array)."
     )
-    # Two attempts: JSON-mode then plain with fence extraction
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.1,
             messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": diff_text[:120000]}],
+                      {"role": "user", "content": diff_text[:120000]}], #as per model token limit
             response_format={"type": "json_object"},
         )
         data = json.loads(resp.choices[0].message.content or "[]")
         if isinstance(data, dict) and "items" in data:
             data = data["items"]
         if isinstance(data, dict):
-            # fallback: first list value
             for v in data.values():
                 if isinstance(v, list):
                     data = v
@@ -73,8 +63,8 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
         return data if isinstance(data, list) else []
     except Exception:
         pass
-    # Fallback: no enforced JSON, try to extract fenced JSON
     try:
+        #as a fallback; no enforced JSON via LLM, so using fenced JSON approach
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.1,
@@ -83,25 +73,15 @@ def llm_plan_from_diff(client: OpenAI, diff_text: str) -> List[Dict[str, Any]]:
         )
         return extract_json_from_fences(resp.choices[0].message.content or "[]")
     except Exception as e:
-        sys.stderr.write(f"[WARN] LLM parse failed: {e}\n")
+        sys.stderr.write(f"LLM parse failed: {e}\n")
         return []
 
-
-# ----------------- Build Postman Collection -----------------
 def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Generates three scenarios per endpoint:
-      (unauth)  -> token_none,     expect 401
-      (owner)   -> token_owner + owner IDs, expect 200 (happy path)
-      (x-tenant)-> token_owner + other IDs, expect 403/404 (BOLA/BFLA probe)
-
-    Accepts tests from the LLM in string/dict/number shapes and merges them into assertions.
-    """
+    #accepts tests from the LLM and merges them into assertions
     def norm(ep: str) -> str:
         ep = ep or "/"
         if not ep.startswith("/"):
             ep = "/" + ep
-        # {id} -> {{id}} for Postman variables
         return re.sub(r"\{([^}/]+)\}", r"{{\1}}", ep)
 
     def path_vars(ep: str) -> List[str]:
@@ -119,7 +99,7 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -
         for v in path_vars(e):
             own, oth = id_map_for(v)
             e = e.replace("{{"+v+"}}", own if owner else oth)
-        return e
+        return e #dynamic endpoint update for sec. tests
 
     def add_expect_from_label(script: List[str], lbl: str):
         s = (lbl or "").lower()
@@ -137,6 +117,7 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -
         status = d.get("expect") or d.get("expectStatus") or d.get("status")
         type_hint = str(d.get("type") or "").lower()
         map_ = {
+            #to normalize possible LLM-generated type hints into consistent Postman assertions
             "unauth": (401, "Unauthenticated -> 401"),
             "authn": (401, "Unauthenticated -> 401"),
             "bfla": (403, "Forbidden -> 403"),
@@ -166,8 +147,7 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -
             script.append(f'expect({st}, "{lab}");'); return
         if label:
             add_expect_from_label(script, label); return
-        # Generic safety net
-        script.append('pm.test("Generic check", () => pm.expect([200,201,202,400,401,403,404,409]).to.include(code));')
+        script.append('pm.test("Generic check", () => pm.expect([200,201,202,400,401,403,404,409]).to.include(code));') #NOTA - generic safety nest
 
     def pm_item(name: str, method: str, endpoint: str, token_expr: str, tests: Any) -> Dict[str, Any]:
         path_parts = endpoint.lstrip("/").split("/") if endpoint != "/" else []
@@ -190,9 +170,8 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -
             elif isinstance(t, dict):
                 add_expect_from_dict(script, t); added_any = True
         if not added_any:
-            script.append('pm.test("Generic check", () => pm.expect([200,201,202,400,401,403,404,409]).to.include(code));')
+            script.append('pm.test("Generic check", () => pm.expect([200,201,202,400,401,403,404,409]).to.include(code));') 
 
-        # RETURN BLOCK with PRE-REQUEST MAPPING (the fix)
         return {
             "name": name,
             "request": {
@@ -207,7 +186,7 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -
                     "script": {
                         "type": "text/javascript",
                         "exec": [
-                            "// Map owner/x-tenant variables into the path variables used by URL",
+                            "//map owner/x-tenant variables into the path variables used by URL",
                             "const scenario = pm.info.requestName || '';",
                             "const isOwner = scenario.includes('(owner)');",
                             "const isX = scenario.includes('(x-tenant)');",
@@ -221,7 +200,7 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -
                             "setIfUsed('orderId',   'order_owner',   'order_other');",
                             "setIfUsed('accountId', 'account_owner', 'account_other');",
                             "setIfUsed('userId',    'user_owner',    'user_other');",
-                            "// Generic fallback",
+                            "//generic fallback",
                             "setIfUsed('id',        'id_owner',      'id_other');"
                         ]
                     }
@@ -244,14 +223,12 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -
         ep_norm = norm(ep)
         ep_owner = replace_ids(ep, owner=True)
         ep_other = replace_ids(ep, owner=False)
-
-        # Build: unauth / owner / x-tenant
         items.append(pm_item(f"(unauth) {method} {ep_norm}", method, ep_norm, "{{token_none}}", ["Unauthenticated -> 401"]))
         items.append(pm_item(f"(owner) {method} {ep_norm}", method, ep_owner, "{{token_owner}}", ["OK -> 200"]))
         items.append(pm_item(f"(x-tenant) {method} {ep_norm}", method, ep_other, "{{token_owner}}", ["Forbidden -> 403", "Not found -> 404"]))
 
     if not items:
-        items.append(pm_item("(owner) GET /me", "GET", "/me", "{{token_owner}}", ["OK -> 200"]))
+        items.append(pm_item("(owner) GET /me", "GET", "/me", "{{token_owner}}", ["OK -> 200"])) #to not fail CI when LLM hallucinates with plan.json
 
     return {
         "info": {
@@ -274,13 +251,10 @@ def build_postman_collection(collection_name: str, plan: List[Dict[str, Any]]) -
             {"key": "id_owner",        "value": "1"},
             {"key": "id_other",        "value": "2"},
         ]
-    }
+    } #for production-data usage, you can fetch from securely stored environement variables
 
-
-# ----------------- MCP helpers -----------------
 def call_tool(mcp: McpHttp, name: str, args: Dict[str, Any]) -> Any:
     return mcp.call_tool(name, args)
-
 
 def normalize_workspaces(obj: Any) -> List[Dict[str, Any]]:
     if isinstance(obj, dict):
@@ -292,7 +266,6 @@ def normalize_workspaces(obj: Any) -> List[Dict[str, Any]]:
         return obj
     return []
 
-
 def collection_id_from_create(resp: Any) -> Optional[str]:
     if not isinstance(resp, dict):
         return None
@@ -300,8 +273,6 @@ def collection_id_from_create(resp: Any) -> Optional[str]:
         return resp["collection"]["id"]
     return resp.get("id") or resp.get("collectionId")
 
-
-# ----------------- main -----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="openapi/api.v1.yaml")
@@ -310,24 +281,20 @@ def main():
     ap.add_argument("--collection", default="security test collection")
     ap.add_argument("--plan", default="plan.json")
     args = ap.parse_args()
-
-    # Validate + diff
+    
     run(["swagger-cli", "validate", args.base])
     run(["swagger-cli", "validate", args.head])
     diff_json = run(["oasdiff", "diff", "--format", "json", args.base, args.head])
     with open(args.diff, "w") as f:
         f.write(diff_json)
 
-    # LLM plan
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     plan = [] if looks_empty_diff(diff_json) else llm_plan_from_diff(client, diff_json)
     with open(args.plan, "w") as f:
         json.dump(plan, f, indent=2)
 
-    # Build collection
     pm_collection = build_postman_collection(args.collection, plan)
 
-    # MCP: workspace lookup
     mcp = McpHttp(os.environ["POSTMAN_MCP_URL"], os.environ["POSTMAN_API_KEY"])
     ws_obj = call_tool(mcp, "getWorkspaces", {})
     ws_list = normalize_workspaces(ws_obj)
@@ -337,16 +304,14 @@ def main():
         raise SystemExit(f"Workspace {ws_name} not found. Found: {[w.get('name') for w in ws_list]}")
     workspace_id = ws["id"]
 
-    # Idempotent: delete existing collection with same name
     try:
         existing = call_tool(mcp, "searchCollections", {"workspace": workspace_id, "query": args.collection})
         if isinstance(existing, dict) and existing.get("items"):
             cid0 = existing["items"][0]["id"]
-            call_tool(mcp, "deleteCollection", {"collectionId": cid0})
+            call_tool(mcp, "deleteCollection", {"collectionId": cid0}) #as needed, update the MCP call to update the existing one
     except Exception as e:
         sys.stderr.write(f"[WARN] deleteCollection failed or not necessary: {e}\n")
 
-    # Create and fetch collection
     created = call_tool(mcp, "createCollection", {"workspace": workspace_id, "collection": pm_collection})
     cid = collection_id_from_create(created)
     if not cid:
@@ -356,8 +321,7 @@ def main():
     with open("generated-security-test.postman_collection.json", "w") as f:
         json.dump(collection_obj, f, indent=2)
     print("MCP: collection created & fetched.")
-
-    # Ensure environment with tokens/IDs
+    
     env_name = "Local Security Test"
     env_vars = [
         {"key": "baseUrl",        "value": "http://127.0.0.1:8000"},
@@ -376,7 +340,7 @@ def main():
     ]
     try:
         env = {"name": env_name, "values": env_vars}
-        call_tool(mcp, "createEnvironment", {"workspace": workspace_id, "environment": env})
+        call_tool(mcp, "createEnvironment", {"workspace": workspace_id, "environment": env}) #for production usage, use securely stored environment variables
         print(f"MCP: environment ensured: {env_name}")
     except Exception as e:
         print(f"[WARN] could not create env: {e}")
