@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# tools/postman_json_to_sarif.py
-#
-# Convert Postman CLI JSON run report -> SARIF v2.1.0
-# - Robust to missing run.failures
-# - Extracts failed tests from executions[*].tests
-# - Produces GitHub-friendly artifactLocation URIs (no scheme/colon/spaces)
-
 import json
 import sys
 import re
@@ -16,11 +8,9 @@ def load_json(path):
         return json.load(f)
 
 def slugify(s: str) -> str:
-    # remove http://127.0.0.1:8000 etc and collapse to a safe relative path
     s = re.sub(r"https?://", "", s, flags=re.IGNORECASE)
     s = s.replace("127.0.0.1:8000", "")
     s = s.strip()
-    # no spaces / punctuation that SARIF/GitHub might dislike in first segment
     s = re.sub(r"[^A-Za-z0-9/_-]+", "_", s)
     s = re.sub(r"_+", "_", s)
     s = s.strip("_/")
@@ -62,7 +52,6 @@ def build_sarif(run_json: dict) -> dict:
             level = infer_level(assertion, message)
             rid = rule_id_from(assertion)
 
-            # Keep a rule entry (with a readable description) once per ruleId
             if rid not in rules_dict:
                 rules_dict[rid] = {
                     "id": rid,
@@ -79,14 +68,12 @@ def build_sarif(run_json: dict) -> dict:
                 "message": {"text": f"{item_name}: {message}"},
                 "locations": [{
                     "physicalLocation": {
-                        # IMPORTANT: a relative, scheme-less path (no colon in first segment)
                         "artifactLocation": {"uri": safe_uri},
                         "region": {"startLine": 1, "startColumn": 1}
                     }
                 }]
             })
 
-    # Add a clean-run informational result when nothing failed (keeps the upload meaningful)
     if not results:
         rid = "postman.security.cleanrun"
         rules_dict[rid] = {
