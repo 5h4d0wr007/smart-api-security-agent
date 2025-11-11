@@ -1,11 +1,9 @@
-# tools/mcp_client.py
 import json
 import uuid
 import requests
 from typing import Any, Dict, Optional, List
 
 def _maybe_parse_json_string(s: str) -> Any:
-    """Try to parse JSON from a raw string; fall back to extracting the first {...} or [...] block."""
     s = (s or "").strip()
     if not s:
         return None
@@ -24,16 +22,6 @@ def _maybe_parse_json_string(s: str) -> Any:
     return None
 
 class McpHttp:
-    """
-    Minimal JSON-RPC client for MCP Streamable HTTP.
-
-    Handles:
-    - Accept: "application/json, text/event-stream"
-    - Plain JSON ("{jsonrpc:..., result: ...}")
-    - Message envelopes: {"content":[{"type":"text","text":"{...json...}"}]}
-    - SSE text/event-stream with "data: {...}" lines
-    - Empty bodies (202/204)
-    """
     def __init__(self, url: str, api_key: str, timeout_sec: int = 120):
         self.url = url.rstrip("/")
         self.timeout = timeout_sec
@@ -61,29 +49,25 @@ class McpHttp:
 
         ctype = (r.headers.get("Content-Type") or "").lower()
 
-        # 1) application/json
         if "application/json" in ctype:
             try:
                 data = r.json()
             except requests.exceptions.JSONDecodeError:
                 data = _maybe_parse_json_string(body)
 
-            # JSON-RPC envelope
             if isinstance(data, dict) and "result" in data:
                 res = data["result"]
                 if isinstance(res, dict) and "content" in res:
                     unwrapped = self._unwrap_content(res["content"])
                     return unwrapped if unwrapped is not None else res
                 return res
-
-            # message envelope at top-level
+                
             if isinstance(data, dict) and "content" in data:
                 unwrapped = self._unwrap_content(data["content"])
                 return unwrapped if unwrapped is not None else data
 
             return data
 
-        # 2) text/event-stream (SSE)
         if "text/event-stream" in ctype or body.startswith("event:") or "data:" in body:
             last_json = None
             for raw_line in body.splitlines():
@@ -101,12 +85,10 @@ class McpHttp:
                 return unwrapped if unwrapped is not None else last_json
             return last_json
 
-        # 3) lenient fallback
         parsed = _maybe_parse_json_string(body)
         return parsed if parsed is not None else body
 
     def _unwrap_content(self, content: Any) -> Any:
-        """Unwrap {"content":[{"type":"text","text":"{...json...}"}]} payloads."""
         if not isinstance(content, list):
             return None
         texts: List[str] = []
