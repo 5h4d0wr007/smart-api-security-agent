@@ -1,4 +1,4 @@
-#added with postman_json_to_sarif to cover different possibilities of CLI run output
+#added with postman_json_to_sarif (other converter) to cover different possibilities of CLI run output
 import json, sys, re
 from typing import Any, Dict, List
 
