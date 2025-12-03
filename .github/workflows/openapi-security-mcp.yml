@@ -1,0 +1,279 @@
+name: API Security with LLM & Postman MCP
+
+on:
+  pull_request:
+    paths:
+      - "openapi/**.y*ml"
+      - "openapi/**.json"
+      - "app/**"
+      - "tools/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: write
+
+env:
+  POSTMAN_MCP_URL: ${{ vars.POSTMAN_MCP_URL }}                
+  POSTMAN_WORKSPACE_NAME: ${{ vars.POSTMAN_WORKSPACE_NAME }}  
+  POSTMAN_ENV_NAME: ${{ vars.POSTMAN_ENV_NAME }} #Need to use for env sync via MCP later
+
+jobs:
+  test-on-openapi-change:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node (for swagger-cli)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r app/requirements.txt
+          pip install openai requests
+
+      - name: Install CLI tooling (Postman CLI + swagger-cli)
+        run: |
+          curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
+          npm i -g @apidevtools/swagger-cli@4
+          postman --version
+          swagger-cli --version
+
+      - name: Install oasdiff (Linux binary, pinned)
+        run: |
+          set -euo pipefail
+          OASDIFF_VERSION="v1.10.28"
+          TARBALL="oasdiff_${OASDIFF_VERSION#v}_linux_amd64.tar.gz"
+          URL_PRIMARY="https://github.com/Tufin/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          URL_FALLBACK="https://github.com/oasdiff/oasdiff/releases/download/${OASDIFF_VERSION}/${TARBALL}"
+          echo "Downloading oasdiff ${OASDIFF_VERSION}…"
+          if ! curl -fL "$URL_PRIMARY" -o oasdiff.tgz; then
+            echo "Primary URL failed, trying fallback…"
+            curl -fL "$URL_FALLBACK" -o oasdiff.tgz
+          fi
+          tar -xzf oasdiff.tgz
+          chmod +x oasdiff
+          sudo mv oasdiff /usr/local/bin/oasdiff
+
+      - name: Start sample app (localhost:8000)
+        run: |
+          python app/app.py &
+          echo $! > app.pid
+          for i in {1..20}; do
+            if curl -fsSI http://127.0.0.1:8000/ >/dev/null 2>&1; then
+              echo "App is up"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Compute OpenAPI diff (base vs head)
+        run: |
+          set -euo pipefail
+          BASE=origin/${{ github.base_ref }}
+          HEAD=origin/${{ github.head_ref }}
+          mkdir -p .tmp
+          FILE=$(git diff --name-only "$BASE...$HEAD" | grep -E '^openapi/.*\.(ya?ml|json)$' | head -n1 || true)
+          if [ -z "${FILE:-}" ]; then
+            echo "No OpenAPI changes detected."
+            echo '{}' > diff.json
+          else
+            git show "$BASE:$FILE" > .tmp/base.yaml || cp openapi/api.v1.yaml .tmp/base.yaml
+            git show "$HEAD:$FILE" > .tmp/head.yaml || cp openapi/api.yaml    .tmp/head.yaml
+            swagger-cli validate .tmp/base.yaml
+            swagger-cli validate .tmp/head.yaml
+            oasdiff diff --format json .tmp/base.yaml .tmp/head.yaml > diff.json
+          fi
+          echo "Wrote diff.json"
+
+      - name: LLM → plan & create/overwrite collection via Postman MCP
+        env:
+          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+        run: |
+          python tools/agent_openapi_to_postman.py \
+            --base openapi/api.v1.yaml \
+            --head openapi/api.yaml \
+            --diff diff.json \
+            --collection "security test collection" \
+            --plan plan.json
+
+      - name: Postman CLI login (non-interactive)
+        env:
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+        run: |
+          postman login --with-api-key "$POSTMAN_API_KEY"
+
+      - name: Run generated collection with Postman CLI (JSON reporter)
+        continue-on-error: true
+        run: |
+          postman collection run ./generated-security-test.postman_collection.json \
+            --reporters cli,json \
+            --reporter-json-export run.json \
+          || true
+          [ -f run.json ] || echo '{"run":{"executions":[],"summary":{"tests":{"executed":0,"failed":0,"passed":0}}}}' > run.json
+
+      - name: Convert Postman report → SARIF
+        run: |
+          python tools/postman_json_to_sarif.py run.json sarif.json
+
+      - name: Build PR summary markdown
+        if: github.event_name == 'pull_request'
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+
+          const ok = '✅'; //To be used for template based on LLM results - not determininstic
+          const fail = '❌'; //To be used for template based on LLM results - not determininstic
+          const info = 'ℹ️'; //To be used for template based on LLM results - not determininstic
+
+          const asText = (x) => (typeof x === 'string' ? x : JSON.stringify(x));
+
+          let run = null;
+          try { run = JSON.parse(fs.readFileSync('run.json','utf8')); } catch {}
+          const execs = run?.run?.executions || [];
+          let passCount = 0, failCount = 0;
+
+          const parseName = (name='') => {
+            //e.g. Like in our case of hybrid LLM driven but deterministic skeleton: "(x-tenant) POST /orders/:id/cancel"
+            const m = name.match(/^\(([^)]+)\)\s+([A-Z]+)\s+(.+)$/);
+            if (!m) return { scenario:'', method:'', path:name.trim() };
+            return { scenario: m[1], method: m[2], path: m[3] };
+          };
+
+          const evaluate = ({scenario, method, path, code}) => {
+            let expected, passed, why;
+
+            if (scenario === 'unauth') {
+              expected = '401 (blocked)';
+              passed = (code === 401);
+              why = passed
+                ? 'Unauthenticated access is correctly rejected. Not a vulnerability.'
+                : 'Unauthenticated request was not blocked — potential Broken Authentication.';
+            } else if (scenario === 'x-tenant') {
+              expected = 'blocked (403 or 404)';
+              passed = (code === 403 || code === 404);
+              why = passed
+                ? 'Cross-tenant access is blocked (either hidden as 404 or denied as 403).'
+                : 'Cross-tenant access not blocked — likely IDOR or missing tenant scoping.';
+            } else if (scenario === 'owner') {
+              const isAdminRoute = path.startsWith('/admin/');
+              if (isAdminRoute) {
+                expected = '403 (non-admin should be blocked)';
+                passed = (code === 403);
+                why = passed
+                  ? 'Non-admin user is correctly blocked from admin endpoint.'
+                  : 'Non-admin user could not access admin route as expected — check why it returned ' + code + ' instead of 403.';
+              } else {
+                expected = '200 (happy path)';
+                passed = (code === 200);
+                why = passed
+                  ? 'Authorized owner can perform their operation successfully.'
+                  : (code === 400
+                      ? 'Request failed validation (400). Check test body/params or server validation rules.'
+                      : 'Authorized user was blocked — verify auth scope/permissions and route handling.');
+              }
+            } else {
+              expected = '—';
+              passed = false;
+              why = 'Unknown scenario label; adjust generator naming.';
+            }
+
+            return { expected, passed, why };
+          };
+
+          const groups = new Map(); //key -> {rows:[]}
+          for (const e of execs) {
+            const { scenario, method, path } = parseName(e?.requestExecuted?.name || '');
+            const code = e?.response?.code;
+            const key = `${method} ${path}`;
+            const { expected, passed, why } = evaluate({scenario, method, path, code});
+            const row = {
+              scenario, test: expected, result: `${passed ? ok+' passed' : fail+' failed'} [HTTP ${code}]`,
+              details: (passed ? 'met expectation' : `expected ${expected.split(' ')[0]} got ${code}`),
+              why
+            };
+            if (!groups.has(key)) groups.set(key, { rows: [] });
+            groups.get(key).rows.push(row);
+            if (passed) passCount++; else failCount++;
+          }
+
+          const renderedCount = Array.from(groups.values())
+            .reduce((n, g) => n + g.rows.length, 0);
+
+          const lines = [];
+          lines.push('**Postman Security Test Agent — Findings (Grouped by Endpoint, Actionable)**');
+          lines.push('');
+          lines.push(`Ran ${renderedCount} test${renderedCount===1?'':'s'} across ${groups.size} endpoints — ${ok} ${passCount} passed · ${fail} ${failCount} failed.`);
+          lines.push('');
+
+          const renderTable = (rows) => {
+            const hdr = '| Scenario | Check | Result | Details | Why it matters |';
+            const sep = '|---|---|---|---|---|';
+            const body = rows.map(r => `| \`${r.scenario}\` | ${r.test} | ${r.result} | ${r.details} | ${r.why} |`);
+            return [hdr, sep, ...body].join('\n');
+          };
+
+          for (const [endpoint, data] of groups) {
+            lines.push('');
+            lines.push(`#### \`${endpoint}\``);
+            lines.push('');
+            const order = { 'unauth': 1, 'owner': 2, 'x-tenant': 3 };
+            const sorted = [...data.rows].sort((a,b)=>(order[a.scenario]||9)-(order[b.scenario]||9));
+            lines.push(renderTable(sorted));
+          }
+
+          lines.push('');
+          lines.push('_Legend:_' );
+          lines.push(`- \`${ok} passed\` — behavior matches security expectation.`);
+          lines.push(`- \`${fail} failed\` — investigate. For owner=400, check request body/params; for owner/x-tenant returning 2xx, check authorization/tenant checks.`);
+          lines.push('');
+          lines.push('Artifacts: `diff.json`, `plan.json`, `run.json`, `sarif.json`, and the generated collection are attached to this run.');
+          fs.writeFileSync('sarif_summary.md', lines.join('\n'));
+          NODE
+
+      - uses: marocchino/sticky-pull-request-comment@v2
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+        with:
+          header: API Security Summary
+          path: sarif_summary.md
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif.json
+          category: openapi-postman-security
+          ref: ${{ github.event_name == 'pull_request' && format('refs/heads/{0}', github.head_ref) || github.ref }}
+          sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Upload artifacts (diff, plan, run, sarif, collection)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-security-output
+          path: |
+            diff.json
+            plan.json
+            run.json
+            sarif.json
+            generated-security-test.postman_collection.json
+
+      - name: Stop sample app
+        if: always()
+        run: |
+          kill "$(cat app.pid)" 2>/dev/null || true
